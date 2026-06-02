@@ -327,22 +327,17 @@ void Particle::ParticleEngine::ghost_particles()
 {
   TEUCHOS_FUNC_TIME_MONITOR("Particle::ParticleEngine::GhostParticles");
 
-  std::vector<std::vector<ParticleObjShrdPtr>> particlestosend(
-      Core::Communication::num_mpi_ranks(comm_));
-  std::vector<std::vector<std::pair<int, ParticleObjShrdPtr>>> particlestoinsert(typevectorsize_);
+  std::map<int, std::vector<char>> sdata;
   std::map<int, std::map<ParticleType, std::map<int, std::pair<int, int>>>> directghosting;
 
   // clear all containers of ghosted particles
   particlecontainerbundle_->clear_all_containers_of_specific_status(Ghosted);
 
-  // determine particles that need to be ghosted
-  determine_particles_to_be_ghosted(particlestosend);
+  // pack particles to be ghosted directly into send buffers (bypasses ParticleObject)
+  pack_particles_to_be_ghosted(sdata);
 
-  // communicate particles
-  communicate_particles(particlestosend, particlestoinsert);
-
-  // insert ghosted particles received from other processors
-  insert_ghosted_particles(particlestoinsert, directghosting);
+  // communicate ghost data and insert into containers using cached comm graph (no Allreduce)
+  communicate_and_insert_ghost_particles(sdata, directghosting);
 
   // communicate and build map for direct ghosting
   communicate_direct_ghosting_map(directghosting);
@@ -1190,6 +1185,15 @@ void Particle::ParticleEngine::determine_ghosting_dependent_maps_and_sets()
       }
     }
   }
+
+  // cache ghost particle communication procs derived from bin ghosting topology (no Allreduce)
+  ghost_send_procs_.clear();
+  for (const auto& it : binning_->thisbinsghostedby_)
+    for (int proc : it.second) ghost_send_procs_.insert(proc);
+
+  ghost_recv_procs_.clear();
+  for (int gid : binning_->ghostedbins_)
+    ghost_recv_procs_.insert(binning_->binstrategy_->bin_discret()->g_element(gid)->owner());
 }
 
 void Particle::ParticleEngine::relate_half_neighboring_bins_to_owned_bins()
@@ -1527,8 +1531,8 @@ void Particle::ParticleEngine::determine_particles_to_be_transferred(
   }
 }
 
-void Particle::ParticleEngine::determine_particles_to_be_ghosted(
-    std::vector<std::vector<ParticleObjShrdPtr>>& particlestosend) const
+void Particle::ParticleEngine::pack_particles_to_be_ghosted(
+    std::map<int, std::vector<char>>& sdata) const
 {
   // safety check
   if (not validownedparticles_) FOUR_C_THROW("invalid relation of owned particles to bins!");
@@ -1561,12 +1565,23 @@ void Particle::ParticleEngine::determine_particles_to_be_ghosted(
       ParticleStates states;
       container->get_particle(ownedindex, globalid, states);
 
-      // iterate over target processors
+      // pre-pack header (type, globalid, bingid, ownedindex) once per particle
+      Core::Communication::PackBuffer header;
+      add_to_pack(header, static_cast<int>(type));
+      add_to_pack(header, globalid);
+      add_to_pack(header, ghostedbin);
+      add_to_pack(header, ownedindex);
+
+      // pre-pack states once, reused for all target processors
+      Core::Communication::PackBuffer statesdata;
+      add_to_pack(statesdata, states);
+
+      // iterate over target processors and append packed data
       for (int sendtoproc : targetIt.second)
       {
-        // append particle to be send
-        particlestosend[sendtoproc].emplace_back(
-            std::make_shared<ParticleObject>(type, globalid, states, ghostedbin, ownedindex));
+        auto& buf = sdata[sendtoproc];
+        buf.insert(buf.end(), header().begin(), header().end());
+        buf.insert(buf.end(), statesdata().begin(), statesdata().end());
       }
     }
   }
@@ -1865,8 +1880,66 @@ void Particle::ParticleEngine::communicate_direct_ghosting_map(
   // clear after all ghosting information is packed
   directghosting.clear();
 
-  // communicate data via non-buffered send from proc to proc
-  ParticleUtils::immediate_recv_blocking_send(comm_, sdata, rdata);
+  // communicate direct ghosting map using cached ghost comm graph (no Allreduce)
+  // send to ghost_recv_procs_ (procs that sent us ghost data); receive from ghost_send_procs_
+  const int numsendtoprocs_dgm = static_cast<int>(ghost_recv_procs_.size());
+  const int numrecvfromprocs_dgm = static_cast<int>(ghost_send_procs_.size());
+
+  std::vector<MPI_Request> sizesendrequest_dgm(numsendtoprocs_dgm);
+  std::vector<int> msgsizestosend_dgm(numsendtoprocs_dgm);
+  {
+    int counter = 0;
+    for (int torank : ghost_recv_procs_)
+    {
+      auto it = sdata.find(torank);
+      msgsizestosend_dgm[counter] =
+          (it != sdata.end()) ? static_cast<int>(it->second.size()) : 0;
+      MPI_Isend(&msgsizestosend_dgm[counter], 1, MPI_INT, torank, 1234, comm_,
+          &sizesendrequest_dgm[counter]);
+      ++counter;
+    }
+  }
+
+  std::vector<int> recvsources_dgm(ghost_send_procs_.begin(), ghost_send_procs_.end());
+  std::vector<int> msgsizestorecv_dgm(numrecvfromprocs_dgm);
+  std::vector<MPI_Request> sizerecvrequest_dgm(numrecvfromprocs_dgm);
+  for (int i = 0; i < numrecvfromprocs_dgm; ++i)
+    MPI_Irecv(&msgsizestorecv_dgm[i], 1, MPI_INT, recvsources_dgm[i], 1234, comm_,
+        &sizerecvrequest_dgm[i]);
+
+  MPI_Waitall(numrecvfromprocs_dgm, sizerecvrequest_dgm.data(), MPI_STATUSES_IGNORE);
+
+  std::vector<MPI_Request> recvrequest_dgm(numrecvfromprocs_dgm);
+  for (int i = 0; i < numrecvfromprocs_dgm; ++i)
+  {
+    if (msgsizestorecv_dgm[i] > 0)
+    {
+      rdata[recvsources_dgm[i]].resize(msgsizestorecv_dgm[i]);
+      MPI_Irecv(rdata[recvsources_dgm[i]].data(), msgsizestorecv_dgm[i], MPI_CHAR,
+          recvsources_dgm[i], 5678, comm_, &recvrequest_dgm[i]);
+    }
+    else
+    {
+      recvrequest_dgm[i] = MPI_REQUEST_NULL;
+    }
+  }
+
+  MPI_Waitall(numsendtoprocs_dgm, sizesendrequest_dgm.data(), MPI_STATUSES_IGNORE);
+
+  std::vector<MPI_Request> sendrequest_dgm;
+  sendrequest_dgm.reserve(sdata.size());
+  for (auto& p : sdata)
+  {
+    sendrequest_dgm.emplace_back();
+    MPI_Isend(p.second.data(), static_cast<int>(p.second.size()), MPI_CHAR, p.first, 5678, comm_,
+        &sendrequest_dgm.back());
+  }
+
+  if (!sendrequest_dgm.empty())
+    MPI_Waitall(
+        static_cast<int>(sendrequest_dgm.size()), sendrequest_dgm.data(), MPI_STATUSES_IGNORE);
+  sdata.clear();
+  MPI_Waitall(numrecvfromprocs_dgm, recvrequest_dgm.data(), MPI_STATUSES_IGNORE);
 
   // init receiving map
   std::map<ParticleType, std::map<int, std::pair<int, int>>> receiveddirectghosting;
@@ -1977,57 +2050,110 @@ void Particle::ParticleEngine::insert_owned_particles(
   invalidate_particle_safety_flags();
 }
 
-void Particle::ParticleEngine::insert_ghosted_particles(
-    std::vector<std::vector<std::pair<int, ParticleObjShrdPtr>>>& particlestoinsert,
+void Particle::ParticleEngine::communicate_and_insert_ghost_particles(
+    std::map<int, std::vector<char>>& sdata,
     std::map<int, std::map<ParticleType, std::map<int, std::pair<int, int>>>>& directghosting)
 {
-  // iterate over particle types
-  for (const auto& type : particlecontainerbundle_->get_particle_types())
+  const int numsendtoprocs = static_cast<int>(ghost_send_procs_.size());
+  const int numrecvfromprocs = static_cast<int>(ghost_recv_procs_.size());
+
+  // send size of messages to ALL known ghost targets (0 if no data)
+  std::vector<MPI_Request> sizesendrequest(numsendtoprocs);
+  std::vector<int> msgsizestosend(numsendtoprocs);
   {
-    // check for particles of current type
-    if (particlestoinsert[type].empty()) continue;
-
-    // get container of ghosted particles of current particle type
-    ParticleContainer* container = particlecontainerbundle_->get_specific_container(type, Ghosted);
-
-    // iterate over particle objects pairs
-    for (const auto& objectpair : particlestoinsert[type])
+    int counter = 0;
+    for (int torank : ghost_send_procs_)
     {
-      // get owner of sending processor
-      int sendingproc = objectpair.first;
+      auto it = sdata.find(torank);
+      msgsizestosend[counter] = (it != sdata.end()) ? static_cast<int>(it->second.size()) : 0;
+      MPI_Isend(
+          &msgsizestosend[counter], 1, MPI_INT, torank, 1234, comm_, &sizesendrequest[counter]);
+      ++counter;
+    }
+  }
 
-      // get particle object
-      ParticleObjShrdPtr particleobject = objectpair.second;
+  // receive size of messages from ALL known senders
+  std::vector<int> recvsources(ghost_recv_procs_.begin(), ghost_recv_procs_.end());
+  std::vector<int> msgsizestorecv(numrecvfromprocs);
+  std::vector<MPI_Request> sizerecvrequest(numrecvfromprocs);
+  for (int i = 0; i < numrecvfromprocs; ++i)
+  {
+    MPI_Irecv(&msgsizestorecv[i], 1, MPI_INT, recvsources[i], 1234, comm_, &sizerecvrequest[i]);
+  }
 
-      // get global id of particle
-      int globalid = particleobject->return_particle_global_id();
+  // wait for all size receives to complete
+  MPI_Waitall(numrecvfromprocs, sizerecvrequest.data(), MPI_STATUSES_IGNORE);
 
-      // get states of particle
-      const ParticleStates& states = particleobject->return_particle_states();
+  // post receives for actual data from senders with non-zero size
+  std::map<int, std::vector<char>> rdata;
+  std::vector<MPI_Request> recvrequest(numrecvfromprocs);
+  for (int i = 0; i < numrecvfromprocs; ++i)
+  {
+    if (msgsizestorecv[i] > 0)
+    {
+      rdata[recvsources[i]].resize(msgsizestorecv[i]);
+      MPI_Irecv(rdata[recvsources[i]].data(), msgsizestorecv[i], MPI_CHAR, recvsources[i], 5678,
+          comm_, &recvrequest[i]);
+    }
+    else
+    {
+      recvrequest[i] = MPI_REQUEST_NULL;
+    }
+  }
 
-      // get bin of particle
-      const int gidofbin = particleobject->return_bin_gid();
-      if (gidofbin < 0)
-        FOUR_C_THROW("received ghosted particle contains no information about its bin gid!");
+  // wait for size sends to complete, then send data
+  MPI_Waitall(numsendtoprocs, sizesendrequest.data(), MPI_STATUSES_IGNORE);
+
+  std::vector<MPI_Request> sendrequest;
+  sendrequest.reserve(sdata.size());
+  for (auto& p : sdata)
+  {
+    sendrequest.emplace_back();
+    MPI_Isend(p.second.data(), static_cast<int>(p.second.size()), MPI_CHAR, p.first, 5678, comm_,
+        &sendrequest.back());
+  }
+
+  // wait for completion
+  if (!sendrequest.empty())
+    MPI_Waitall(static_cast<int>(sendrequest.size()), sendrequest.data(), MPI_STATUSES_IGNORE);
+  sdata.clear();
+  MPI_Waitall(numrecvfromprocs, recvrequest.data(), MPI_STATUSES_IGNORE);
+
+  // unpack received data directly into ghosted particle containers
+  for (const auto& p : rdata)
+  {
+    const int sendingproc = p.first;
+    Core::Communication::UnpackBuffer buffer(p.second);
+    while (!buffer.at_end())
+    {
+      // unpack particle header
+      int type_int, globalid, bingid, ownedindex;
+      extract_from_pack(buffer, type_int);
+      extract_from_pack(buffer, globalid);
+      extract_from_pack(buffer, bingid);
+      extract_from_pack(buffer, ownedindex);
+
+      // unpack states
+      ParticleStates states;
+      extract_from_pack(buffer, states);
+
+      ParticleType type = static_cast<ParticleType>(type_int);
+
+      // get container of ghosted particles of current particle type
+      ParticleContainer* container = particlecontainerbundle_->get_specific_container(type, Ghosted);
 
       // add particle to container of ghosted particles
       int ghostedindex(0);
       container->add_particle(ghostedindex, globalid, states);
 
       // add index relating (owned and ghosted) particles to col bins
-      particlestobins_[binning_->bincolmap_->lid(gidofbin)].push_back(
+      particlestobins_[binning_->bincolmap_->lid(bingid)].push_back(
           std::make_pair(type, ghostedindex));
 
-      // get local index of particle in container of owned particles of sending processor
-      int ownedindex = particleobject->return_container_index();
-
-      // insert necessary information being communicated to other processors for direct ghosting
+      // insert necessary information for direct ghosting map
       (((directghosting[sendingproc])[type])[ownedindex]) = std::make_pair(myrank_, ghostedindex);
     }
   }
-
-  // clear after all particles are inserted
-  particlestoinsert.clear();
 
   // validate flag denoting valid relation of ghosted particles to bins
   validghostedparticles_ = true;

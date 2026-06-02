@@ -558,16 +558,16 @@ namespace Particle
         std::vector<std::vector<ParticleObjShrdPtr>>& particlestosend);
 
     /*!
-     * \brief determine particles that need to be ghosted
+     * \brief pack particles to be ghosted into send buffers
      *
-     * Determine all particles that need to be ghosted on other processors based on the information
-     * of owned bins, that are ghosted by other processors.
+     * Pack all data of particles that need to be ghosted on other processors directly into send
+     * buffers, bypassing ParticleObject creation. Data packed per particle:
+     * [int type][int globalid][int bingid][int ownedindex][ParticleStates states].
      *
      *
-     * \param[out] particlestosend particles to be send to other processors
+     * \param[out] sdata send buffers indexed by target processor rank
      */
-    void determine_particles_to_be_ghosted(
-        std::vector<std::vector<ParticleObjShrdPtr>>& particlestosend) const;
+    void pack_particles_to_be_ghosted(std::map<int, std::vector<char>>& sdata) const;
 
     /*!
      * \brief pack particles to be refreshed into send buffers
@@ -642,14 +642,18 @@ namespace Particle
         std::vector<std::vector<std::pair<int, ParticleObjShrdPtr>>>& particlestoinsert);
 
     /*!
-     * \brief insert ghosted particles received from other processors
+     * \brief communicate ghost particle data and insert into containers
+     *
+     * Exchanges ghost particle send buffers with remote processors using the cached
+     * ghost_send_procs_ / ghost_recv_procs_ sets (no MPI_Allreduce). Unpacks received data
+     * directly into ghosted particle containers and builds the direct ghosting map,
+     * bypassing ParticleObject creation.
      *
      *
-     * \param[in]  particlestoinsert particles to be inserted into containers on this processor
-     * \param[out] directghosting    direct ghosting information
+     * \param[in]  sdata         send buffers indexed by target processor rank
+     * \param[out] directghosting direct ghosting information
      */
-    void insert_ghosted_particles(
-        std::vector<std::vector<std::pair<int, ParticleObjShrdPtr>>>& particlestoinsert,
+    void communicate_and_insert_ghost_particles(std::map<int, std::vector<char>>& sdata,
         std::map<int, std::map<ParticleType, std::map<int, std::pair<int, int>>>>& directghosting);
 
     /*!
@@ -755,6 +759,12 @@ namespace Particle
 
     //! cached set of procs to receive refreshed particle data from
     std::set<int> refresh_recv_procs_;
+
+    //! cached set of procs to send ghost particle data to (derived from bin ghosting topology)
+    std::set<int> ghost_send_procs_;
+
+    //! cached set of procs to receive ghost particle data from (derived from bin ghosting topology)
+    std::set<int> ghost_recv_procs_;
   };
 
 }  // namespace Particle
