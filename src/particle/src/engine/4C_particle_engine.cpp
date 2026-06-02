@@ -355,18 +355,12 @@ void Particle::ParticleEngine::refresh_particles() const
 {
   TEUCHOS_FUNC_TIME_MONITOR("Particle::ParticleEngine::RefreshParticles");
 
-  std::vector<std::vector<ParticleObjShrdPtr>> particlestosend(
-      Core::Communication::num_mpi_ranks(comm_));
-  std::vector<std::vector<std::pair<int, ParticleObjShrdPtr>>> particlestoinsert(typevectorsize_);
+  // pack particles to be refreshed directly into send buffers
+  std::map<int, std::vector<char>> sdata;
+  pack_particles_to_be_refreshed(sdata);
 
-  // determine particles that need to be refreshed
-  determine_particles_to_be_refreshed(particlestosend);
-
-  // communicate refreshed particles using cached communication graph
-  communicate_refreshed_particles(particlestosend, particlestoinsert);
-
-  // insert refreshed particles received from other processors
-  insert_refreshed_particles(particlestoinsert);
+  // communicate and unpack refreshed particles directly into containers
+  communicate_refreshed_particles(sdata);
 }
 
 void Particle::ParticleEngine::refresh_particles_of_specific_states_and_types(
@@ -375,19 +369,12 @@ void Particle::ParticleEngine::refresh_particles_of_specific_states_and_types(
   TEUCHOS_FUNC_TIME_MONITOR(
       "Particle::ParticleEngine::refresh_particles_of_specific_states_and_types");
 
-  std::vector<std::vector<ParticleObjShrdPtr>> particlestosend(
-      Core::Communication::num_mpi_ranks(comm_));
-  std::vector<std::vector<std::pair<int, ParticleObjShrdPtr>>> particlestoinsert(typevectorsize_);
+  // pack specific states of particles directly into send buffers
+  std::map<int, std::vector<char>> sdata;
+  pack_specific_states_of_particles_to_be_refreshed(particlestatestotypes, sdata);
 
-  // determine particles that need to be refreshed
-  determine_specific_states_of_particles_of_specific_types_to_be_refreshed(
-      particlestatestotypes, particlestosend);
-
-  // communicate refreshed particles using cached communication graph
-  communicate_refreshed_particles(particlestosend, particlestoinsert);
-
-  // insert refreshed particles received from other processors
-  insert_refreshed_particles(particlestoinsert);
+  // communicate and unpack refreshed particles directly into containers
+  communicate_refreshed_particles(sdata);
 }
 
 void Particle::ParticleEngine::dynamic_load_balancing()
@@ -1581,8 +1568,8 @@ void Particle::ParticleEngine::determine_particles_to_be_ghosted(
   }
 }
 
-void Particle::ParticleEngine::determine_particles_to_be_refreshed(
-    std::vector<std::vector<ParticleObjShrdPtr>>& particlestosend) const
+void Particle::ParticleEngine::pack_particles_to_be_refreshed(
+    std::map<int, std::vector<char>>& sdata) const
 {
   // safety check
   if (not validdirectghosting_) FOUR_C_THROW("invalid direct ghosting!");
@@ -1601,9 +1588,14 @@ void Particle::ParticleEngine::determine_particles_to_be_refreshed(
     {
       int ownedindex = indexIt.first;
 
+      // get particle states once
       int globalid(0);
       ParticleStates states;
       container->get_particle(ownedindex, globalid, states);
+
+      // pre-pack states data (reused for all targets of this particle)
+      Core::Communication::PackBuffer statesdata;
+      add_to_pack(statesdata, states);
 
       // iterate over target processors
       for (const auto& targetIt : indexIt.second)
@@ -1611,18 +1603,23 @@ void Particle::ParticleEngine::determine_particles_to_be_refreshed(
         int sendtoproc = targetIt.first;
         int ghostedindex = targetIt.second;
 
-        // append particle to be send
-        particlestosend[sendtoproc].emplace_back(
-            std::make_shared<ParticleObject>(type, -1, states, -1, ghostedindex));
+        // pack type and ghosted index header
+        Core::Communication::PackBuffer header;
+        add_to_pack(header, static_cast<int>(type));
+        add_to_pack(header, ghostedindex);
+
+        // append header + pre-packed states to send buffer
+        auto& buf = sdata[sendtoproc];
+        buf.insert(buf.end(), header().begin(), header().end());
+        buf.insert(buf.end(), statesdata().begin(), statesdata().end());
       }
     }
   }
 }
 
-void Particle::ParticleEngine::
-    determine_specific_states_of_particles_of_specific_types_to_be_refreshed(
-        const StatesOfTypesToRefresh& particlestatestotypes,
-        std::vector<std::vector<ParticleObjShrdPtr>>& particlestosend) const
+void Particle::ParticleEngine::pack_specific_states_of_particles_to_be_refreshed(
+    const StatesOfTypesToRefresh& particlestatestotypes,
+    std::map<int, std::vector<char>>& sdata) const
 {
   // safety check
   if (not validdirectghosting_) FOUR_C_THROW("invalid direct ghosting!");
@@ -1664,15 +1661,25 @@ void Particle::ParticleEngine::
         states[state].assign(state_ptr, state_ptr + statedim);
       }
 
+      // pre-pack states data (reused for all targets of this particle)
+      Core::Communication::PackBuffer statesdata;
+      add_to_pack(statesdata, states);
+
       // iterate over target processors
       for (const auto& targetIt : indexIt.second)
       {
         int sendtoproc = targetIt.first;
         int ghostedindex = targetIt.second;
 
-        // append particle to be send
-        particlestosend[sendtoproc].emplace_back(
-            std::make_shared<ParticleObject>(type, -1, states, -1, ghostedindex));
+        // pack type and ghosted index header
+        Core::Communication::PackBuffer header;
+        add_to_pack(header, static_cast<int>(type));
+        add_to_pack(header, ghostedindex);
+
+        // append header + pre-packed states to send buffer
+        auto& buf = sdata[sendtoproc];
+        buf.insert(buf.end(), header().begin(), header().end());
+        buf.insert(buf.end(), statesdata().begin(), statesdata().end());
       }
     }
   }
@@ -1728,28 +1735,8 @@ void Particle::ParticleEngine::communicate_particles(
 }
 
 void Particle::ParticleEngine::communicate_refreshed_particles(
-    std::vector<std::vector<ParticleObjShrdPtr>>& particlestosend,
-    std::vector<std::vector<std::pair<int, ParticleObjShrdPtr>>>& particlestoreceive) const
+    std::map<int, std::vector<char>>& sdata) const
 {
-  // prepare buffer for sending
-  std::map<int, std::vector<char>> sdata;
-
-  // pack data for sending (only to known refresh targets)
-  for (int torank : refresh_send_procs_)
-  {
-    if (particlestosend[torank].empty()) continue;
-
-    for (const auto& iter : particlestosend[torank])
-    {
-      Core::Communication::PackBuffer data;
-      iter->pack(data);
-      sdata[torank].insert(sdata[torank].end(), data().begin(), data().end());
-    }
-  }
-
-  // clear after all particles are packed
-  particlestosend.clear();
-
   const int numsendtoprocs = static_cast<int>(refresh_send_procs_.size());
   const int numrecvfromprocs = static_cast<int>(refresh_recv_procs_.size());
 
@@ -1815,21 +1802,31 @@ void Particle::ParticleEngine::communicate_refreshed_particles(
   sdata.clear();
   MPI_Waitall(numrecvfromprocs, recvrequest.data(), MPI_STATUSES_IGNORE);
 
-  // unpack and store received data
+  // unpack received data directly into ghosted particle containers
   for (const auto& p : rdata)
   {
-    const int msgsource = p.first;
     const std::vector<char>& rmsg = p.second;
 
     Core::Communication::UnpackBuffer buffer(rmsg);
     while (!buffer.at_end())
     {
-      std::shared_ptr<Core::Communication::ParObject> object(Core::Communication::factory(buffer));
-      ParticleObjShrdPtr particleobject = std::dynamic_pointer_cast<ParticleObject>(object);
-      FOUR_C_ASSERT(particleobject, "received object is not a particle object!");
+      // unpack particle type
+      int type_int;
+      extract_from_pack(buffer, type_int);
+      ParticleType type = static_cast<ParticleType>(type_int);
 
-      particlestoreceive[particleobject->return_particle_type()].push_back(
-          std::make_pair(msgsource, particleobject));
+      // unpack ghosted index
+      int ghostedindex;
+      extract_from_pack(buffer, ghostedindex);
+
+      // unpack states
+      ParticleStates states;
+      extract_from_pack(buffer, states);
+
+      // replace particle directly in container of ghosted particles
+      ParticleContainer* container =
+          particlecontainerbundle_->get_specific_container(type, Ghosted);
+      container->replace_particle(ghostedindex, -1, states);
     }
   }
 }
@@ -2035,39 +2032,6 @@ void Particle::ParticleEngine::insert_ghosted_particles(
   validparticleneighbors_ = false;
   validglobalidtolocalindex_ = false;
   validdirectghosting_ = false;
-}
-
-void Particle::ParticleEngine::insert_refreshed_particles(
-    std::vector<std::vector<std::pair<int, ParticleObjShrdPtr>>>& particlestoinsert) const
-{
-  // iterate over particle types
-  for (const auto& type : particlecontainerbundle_->get_particle_types())
-  {
-    // check for particles of current type
-    if (particlestoinsert[type].empty()) continue;
-
-    // get container of ghosted particles of current particle type
-    ParticleContainer* container = particlecontainerbundle_->get_specific_container(type, Ghosted);
-
-    // iterate over particle objects pairs
-    for (const auto& objectpair : particlestoinsert[type])
-    {
-      // get particle object
-      ParticleObjShrdPtr particleobject = objectpair.second;
-
-      // get states of particle
-      const ParticleStates& states = particleobject->return_particle_states();
-
-      // get local index of particle in container of ghosted particles on this processor
-      int ghostedindex = particleobject->return_container_index();
-
-      // replace particle in container of ghosted particles
-      container->replace_particle(ghostedindex, -1, states);
-    }
-  }
-
-  // clear after all particles are inserted
-  particlestoinsert.clear();
 }
 
 void Particle::ParticleEngine::remove_particles_from_containers(

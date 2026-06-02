@@ -19,6 +19,8 @@
 #include "4C_particle_engine_interface.hpp"
 #include "4C_utils_parameter_list.fwd.hpp"
 
+#include <map>
+
 FOUR_C_NAMESPACE_OPEN
 
 /*---------------------------------------------------------------------------*
@@ -568,28 +570,30 @@ namespace Particle
         std::vector<std::vector<ParticleObjShrdPtr>>& particlestosend) const;
 
     /*!
-     * \brief determine particles that need to be refreshed
+     * \brief pack particles to be refreshed into send buffers
      *
-     * Determine particles that need to be refreshed on other processors based on the direct
-     * ghosting targets map.
+     * Pack all states of particles that need to be refreshed on other processors directly into
+     * send buffers, bypassing ParticleObject creation.
      *
      *
-     * \param[out] particlestosend particles to be send to other processors
+     * \param[out] sdata send buffers indexed by target processor rank
      */
-    void determine_particles_to_be_refreshed(
-        std::vector<std::vector<ParticleObjShrdPtr>>& particlestosend) const;
+    void pack_particles_to_be_refreshed(std::map<int, std::vector<char>>& sdata) const;
 
     /*!
-     * \brief determine specific states of particles of specific type that need to be refreshed
+     * \brief pack specific states of particles of specific types into send buffers
+     *
+     * Pack the information of specific states of particles of specific types directly into
+     * send buffers, bypassing ParticleObject creation.
      *
      *
      * \param[in]  particlestatestotypes particle types and corresponding particle states to be
      *                                   refreshed
-     * \param[out] particlestosend       particles to be send to other processors
+     * \param[out] sdata                 send buffers indexed by target processor rank
      */
-    void determine_specific_states_of_particles_of_specific_types_to_be_refreshed(
+    void pack_specific_states_of_particles_to_be_refreshed(
         const StatesOfTypesToRefresh& particlestatestotypes,
-        std::vector<std::vector<ParticleObjShrdPtr>>& particlestosend) const;
+        std::map<int, std::vector<char>>& sdata) const;
 
     /*!
      * \brief communicate particles
@@ -608,15 +612,13 @@ namespace Particle
      * \brief communicate refreshed particles using cached communication graph
      *
      * Uses the pre-computed refresh_send_procs_ and refresh_recv_procs_ to exchange refreshed
-     * particle data without an MPI_Allreduce for target discovery.
+     * particle data without an MPI_Allreduce for target discovery. Unpacks received data
+     * directly into ghosted particle containers without ParticleObject creation.
      *
      *
-     * \param[in]  particlestosend    particles to be send to other processors
-     * \param[out] particlestoreceive particles to be received on this processor
+     * \param[in] sdata pre-packed send buffers indexed by target processor rank
      */
-    void communicate_refreshed_particles(
-        std::vector<std::vector<ParticleObjShrdPtr>>& particlestosend,
-        std::vector<std::vector<std::pair<int, ParticleObjShrdPtr>>>& particlestoreceive) const;
+    void communicate_refreshed_particles(std::map<int, std::vector<char>>& sdata) const;
 
     /*!
      * \brief communicate and build map for direct ghosting
@@ -649,15 +651,6 @@ namespace Particle
     void insert_ghosted_particles(
         std::vector<std::vector<std::pair<int, ParticleObjShrdPtr>>>& particlestoinsert,
         std::map<int, std::map<ParticleType, std::map<int, std::pair<int, int>>>>& directghosting);
-
-    /*!
-     * \brief insert refreshed particles received from other processors
-     *
-     *
-     * \param[in] particlestoinsert particles to be inserted into containers on this processor
-     */
-    void insert_refreshed_particles(
-        std::vector<std::vector<std::pair<int, ParticleObjShrdPtr>>>& particlestoinsert) const;
 
     /*!
      * \brief remove particles from containers
