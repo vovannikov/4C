@@ -35,12 +35,10 @@ namespace Particle
   {
     /*---------------------------------------------------------------------------*/
     // default particle states
-    Position,                       //!< position
-    Velocity,                       //!< velocity
-    Acceleration,                   //!< acceleration
-    LastTransferPosition,           //!< position after last particle transfer
-    LastNeighborListBuildPosition,  //!< position after last neighbor-list build (Verlet skin
-                                    //!< reference)
+    Position,              //!< position
+    Velocity,              //!< velocity
+    Acceleration,          //!< acceleration
+    LastTransferPosition,  //!< position after last particle transfer
     /*---------------------------------------------------------------------------*/
     // particle states for advanced time integration schemes
     ModifiedVelocity,      //!< modified velocity
@@ -102,7 +100,11 @@ namespace Particle
     DirichletFunctionId,    //!< per-particle Dirichlet function id (0 = no BC, N = follow FUNCT N)
     /*---------------------------------------------------------------------------*/
     // particle states for open boundaries
-    OpenBoundaryId  //!< open boundary id
+    OpenBoundaryId,  //!< open boundary id
+    /*---------------------------------------------------------------------------*/
+    // Verlet skin reference position (kept at the end so integer values of all
+    // preceding enumerators remain stable across rebuilds)
+    LastNeighborListBuildPosition  //!< position after last neighbor-list build
     /*---------------------------------------------------------------------------*/
   };
 

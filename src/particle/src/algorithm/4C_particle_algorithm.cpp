@@ -587,6 +587,12 @@ void Particle::ParticleAlgorithm::determine_particle_types()
 
 void Particle::ParticleAlgorithm::determine_particle_states_of_particle_types()
 {
+  // Verlet skin reference state is only needed when Verlet reuse is potentially
+  // active (factor > 0). Adding it unconditionally would allocate the state and
+  // grow the per-particle refresh/pack payload even at factor=0, which we want
+  // to remain a strict no-op.
+  const bool verlet_state_needed = (params_.get<double>("VERLET_SKIN_FACTOR") > 0.0);
+
   // iterate over particle types
   for (auto& typeIt : particlestatestotypes_)
   {
@@ -595,7 +601,9 @@ void Particle::ParticleAlgorithm::determine_particle_states_of_particle_types()
 
     // insert default particle states
     particlestates.insert({Particle::Position, Particle::Velocity, Particle::Acceleration,
-        Particle::LastTransferPosition, Particle::LastNeighborListBuildPosition});
+        Particle::LastTransferPosition});
+
+    if (verlet_state_needed) particlestates.insert(Particle::LastNeighborListBuildPosition);
   }
 
   // insert integration dependent states of all particle types
