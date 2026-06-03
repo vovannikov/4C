@@ -640,6 +640,16 @@ namespace Particle
         const StatesOfTypesToRefresh& particlestatestotypes) const;
 
     /*!
+     * \brief compute receive sizes for the plain (all-states) refresh path locally
+     *
+     * Mirrors the per-particle pack layout used by pack_particles_to_be_refreshed:
+     * a header [int type, int ghostedindex] followed by the full ParticleStates of
+     * the type. Per-type pack size is deterministic given the container layout, so
+     * the resulting recv-size vector is valid until the ghosting topology changes.
+     */
+    std::vector<int> compute_refresh_all_states_recv_sizes() const;
+
+    /*!
      * \brief communicate and build map for direct ghosting
      *
      * Communicate the information at which local index in the particle container a particle at the
@@ -794,6 +804,11 @@ namespace Particle
     //! cached recv sizes per StatesOfTypesToRefresh pattern (indexed by position in
     //! refresh_recv_procs_); invalidated whenever the ghosting topology is rebuilt
     mutable std::map<StatesOfTypesToRefresh, std::vector<int>> refresh_specific_recv_sizes_cache_;
+
+    //! cached recv sizes for the plain (all-states) refresh_particles path (R2);
+    //! indexed by position in refresh_recv_procs_. Empty means "not yet computed";
+    //! cleared whenever the ghosting topology is rebuilt.
+    mutable std::vector<int> refresh_all_states_recv_sizes_cache_;
 
     //! per-(sender proc, particle type) number of ghost particles received from that sender
     //! during the last ghost rebuild; used to compute refresh-specific recv sizes locally

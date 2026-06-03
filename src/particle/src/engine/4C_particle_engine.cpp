@@ -355,8 +355,14 @@ void Particle::ParticleEngine::refresh_particles() const
   std::map<int, std::vector<char>> sdata;
   pack_particles_to_be_refreshed(sdata);
 
+  // R2: look up cached recv sizes for the all-states refresh pattern; on miss compute
+  // them locally (no MPI round-trip) from the per-(sender,type) ghost counts recorded
+  // during the last ghost rebuild and the deterministic per-particle pack size.
+  if (refresh_all_states_recv_sizes_cache_.empty())
+    refresh_all_states_recv_sizes_cache_ = compute_refresh_all_states_recv_sizes();
+
   // communicate and unpack refreshed particles directly into containers
-  communicate_refreshed_particles(sdata);
+  communicate_refreshed_particles(sdata, &refresh_all_states_recv_sizes_cache_, nullptr);
 }
 
 void Particle::ParticleEngine::refresh_particles_of_specific_states_and_types(
@@ -1955,6 +1961,62 @@ std::vector<int> Particle::ParticleEngine::compute_refresh_specific_recv_sizes(
   return recv_sizes;
 }
 
+std::vector<int> Particle::ParticleEngine::compute_refresh_all_states_recv_sizes() const
+{
+  // Build the per-type deterministic per-particle pack size that
+  // pack_particles_to_be_refreshed produces: a header [int type, int ghostedindex]
+  // followed by the full ParticleStates of the type. We reconstruct the exact
+  // ParticleStates layout that ParticleContainer::get_particle would yield using
+  // the container's set of stored states and their dimensions.
+  std::map<ParticleType, int> per_particle_size;
+  for (const auto& type : particlecontainerbundle_->get_particle_types())
+  {
+    ParticleContainer* container = particlecontainerbundle_->get_specific_container(type, Owned);
+    const std::set<ParticleState>& storedstates = container->get_stored_states();
+
+    if (storedstates.empty())
+    {
+      per_particle_size[type] = 0;
+      continue;
+    }
+
+    const int statesvectorsize = *std::max_element(storedstates.begin(), storedstates.end()) + 1;
+
+    ParticleStates dummy;
+    dummy.assign(statesvectorsize, std::vector<double>(0));
+    for (const auto& state : storedstates)
+      dummy[state].assign(container->get_state_dim(state), 0.0);
+
+    Core::Communication::PackBuffer statesdata;
+    add_to_pack(statesdata, dummy);
+
+    Core::Communication::PackBuffer header;
+    add_to_pack(header, static_cast<int>(type));
+    add_to_pack(header, 0);  // dummy ghosted index
+
+    per_particle_size[type] = static_cast<int>(header().size() + statesdata().size());
+  }
+
+  // sum bytes received from each sender as Sum_type ghost_count[sender][type] * size_per[type]
+  std::vector<int> recv_sizes;
+  recv_sizes.reserve(refresh_recv_procs_.size());
+  for (int sender : refresh_recv_procs_)
+  {
+    int bytes = 0;
+    auto pit = ghost_count_from_proc_.find(sender);
+    if (pit != ghost_count_from_proc_.end())
+    {
+      for (const auto& [type, size_per] : per_particle_size)
+      {
+        auto cit = pit->second.find(type);
+        if (cit != pit->second.end()) bytes += cit->second * size_per;
+      }
+    }
+    recv_sizes.push_back(bytes);
+  }
+  return recv_sizes;
+}
+
 void Particle::ParticleEngine::communicate_direct_ghosting_map(
     std::map<int, std::map<ParticleType, std::map<int, std::pair<int, int>>>>& directghosting)
 {
@@ -2081,6 +2143,7 @@ void Particle::ParticleEngine::communicate_direct_ghosting_map(
 
   // invalidate cached recv sizes — ghosting topology (and thus message sizes) has changed
   refresh_specific_recv_sizes_cache_.clear();
+  refresh_all_states_recv_sizes_cache_.clear();
 
   // cache procs to which we send refreshed particle data
   refresh_send_procs_.clear();
