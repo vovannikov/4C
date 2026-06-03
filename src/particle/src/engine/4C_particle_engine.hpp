@@ -618,7 +618,15 @@ namespace Particle
      *
      * \param[in] sdata pre-packed send buffers indexed by target processor rank
      */
-    void communicate_refreshed_particles(std::map<int, std::vector<char>>& sdata) const;
+    /*!
+     * \param[in]  known_recv_sizes  pre-cached recv sizes (one per entry in refresh_recv_procs_);
+     *                               if non-null the size-exchange round-trip is skipped
+     * \param[out] out_recv_sizes    if non-null, filled with the recv sizes from Phase 1 so the
+     *                               caller can cache them for subsequent calls
+     */
+    void communicate_refreshed_particles(std::map<int, std::vector<char>>& sdata,
+        const std::vector<int>* known_recv_sizes = nullptr,
+        std::vector<int>* out_recv_sizes = nullptr) const;
 
     /*!
      * \brief communicate and build map for direct ghosting
@@ -765,6 +773,10 @@ namespace Particle
 
     //! cached set of procs to receive ghost particle data from (derived from bin ghosting topology)
     std::set<int> ghost_recv_procs_;
+
+    //! cached recv sizes per StatesOfTypesToRefresh pattern (indexed by position in
+    //! refresh_recv_procs_); invalidated whenever the ghosting topology is rebuilt
+    mutable std::map<StatesOfTypesToRefresh, std::vector<int>> refresh_specific_recv_sizes_cache_;
   };
 
 }  // namespace Particle

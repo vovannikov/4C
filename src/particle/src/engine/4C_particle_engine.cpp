@@ -368,8 +368,18 @@ void Particle::ParticleEngine::refresh_particles_of_specific_states_and_types(
   std::map<int, std::vector<char>> sdata;
   pack_specific_states_of_particles_to_be_refreshed(particlestatestotypes, sdata);
 
-  // communicate and unpack refreshed particles directly into containers
-  communicate_refreshed_particles(sdata);
+  // look up cached recv sizes for this state combination to skip the size-exchange round-trip
+  auto it = refresh_specific_recv_sizes_cache_.find(particlestatestotypes);
+  if (it != refresh_specific_recv_sizes_cache_.end())
+  {
+    communicate_refreshed_particles(sdata, &it->second, nullptr);
+  }
+  else
+  {
+    std::vector<int> recv_sizes;
+    communicate_refreshed_particles(sdata, nullptr, &recv_sizes);
+    refresh_specific_recv_sizes_cache_[particlestatestotypes] = std::move(recv_sizes);
+  }
 }
 
 void Particle::ParticleEngine::dynamic_load_balancing()
@@ -1754,39 +1764,52 @@ void Particle::ParticleEngine::communicate_particles(
 }
 
 void Particle::ParticleEngine::communicate_refreshed_particles(
-    std::map<int, std::vector<char>>& sdata) const
+    std::map<int, std::vector<char>>& sdata, const std::vector<int>* known_recv_sizes,
+    std::vector<int>* out_recv_sizes) const
 {
   const int numsendtoprocs = static_cast<int>(refresh_send_procs_.size());
   const int numrecvfromprocs = static_cast<int>(refresh_recv_procs_.size());
 
-  // send size of messages to ALL known refresh targets (0 if no data)
-  std::vector<MPI_Request> sizesendrequest(numsendtoprocs);
-  std::vector<int> msgsizestosend(numsendtoprocs);
-  {
-    int counter = 0;
-    for (int torank : refresh_send_procs_)
-    {
-      auto it = sdata.find(torank);
-      msgsizestosend[counter] = (it != sdata.end()) ? static_cast<int>(it->second.size()) : 0;
-      MPI_Isend(
-          &msgsizestosend[counter], 1, MPI_INT, torank, 1234, comm_, &sizesendrequest[counter]);
-      ++counter;
-    }
-  }
-
-  // receive size of messages from ALL known senders
   std::vector<int> recvsources(refresh_recv_procs_.begin(), refresh_recv_procs_.end());
   std::vector<int> msgsizestorecv(numrecvfromprocs);
-  std::vector<MPI_Request> sizerecvrequest(numrecvfromprocs);
-  for (int i = 0; i < numrecvfromprocs; ++i)
+
+  // Phase 1: size exchange — skipped when recv sizes are already cached
+  std::vector<MPI_Request> sizesendrequest;
+  if (known_recv_sizes != nullptr)
   {
-    MPI_Irecv(&msgsizestorecv[i], 1, MPI_INT, recvsources[i], 1234, comm_, &sizerecvrequest[i]);
+    // use pre-cached recv sizes; no round-trip needed
+    msgsizestorecv = *known_recv_sizes;
+  }
+  else
+  {
+    // send size of messages to ALL known refresh targets (0 if no data)
+    sizesendrequest.resize(numsendtoprocs);
+    std::vector<int> msgsizestosend(numsendtoprocs);
+    {
+      int counter = 0;
+      for (int torank : refresh_send_procs_)
+      {
+        auto it = sdata.find(torank);
+        msgsizestosend[counter] = (it != sdata.end()) ? static_cast<int>(it->second.size()) : 0;
+        MPI_Isend(&msgsizestosend[counter], 1, MPI_INT, torank, 1234, comm_,
+            &sizesendrequest[counter]);
+        ++counter;
+      }
+    }
+
+    // receive size of messages from ALL known senders
+    std::vector<MPI_Request> sizerecvrequest(numrecvfromprocs);
+    for (int i = 0; i < numrecvfromprocs; ++i)
+      MPI_Irecv(
+          &msgsizestorecv[i], 1, MPI_INT, recvsources[i], 1234, comm_, &sizerecvrequest[i]);
+
+    MPI_Waitall(numrecvfromprocs, sizerecvrequest.data(), MPI_STATUSES_IGNORE);
+
+    // hand sizes back to caller for caching
+    if (out_recv_sizes != nullptr) *out_recv_sizes = msgsizestorecv;
   }
 
-  // wait for all size receives to complete
-  MPI_Waitall(numrecvfromprocs, sizerecvrequest.data(), MPI_STATUSES_IGNORE);
-
-  // post receives for actual data from senders with non-zero size
+  // Phase 2: post data receives using now-known sizes
   std::map<int, std::vector<char>> rdata;
   std::vector<MPI_Request> recvrequest(numrecvfromprocs);
   for (int i = 0; i < numrecvfromprocs; ++i)
@@ -1803,8 +1826,10 @@ void Particle::ParticleEngine::communicate_refreshed_particles(
     }
   }
 
-  // wait for size sends to complete, then send data
-  MPI_Waitall(numsendtoprocs, sizesendrequest.data(), MPI_STATUSES_IGNORE);
+  // wait for size sends to complete (if Phase 1 was active), then send data
+  if (!sizesendrequest.empty())
+    MPI_Waitall(
+        static_cast<int>(sizesendrequest.size()), sizesendrequest.data(), MPI_STATUSES_IGNORE);
 
   std::vector<MPI_Request> sendrequest;
   sendrequest.reserve(sdata.size());
@@ -1974,6 +1999,9 @@ void Particle::ParticleEngine::communicate_direct_ghosting_map(
 
   // validate flags denoting validity of direct ghosting
   validdirectghosting_ = true;
+
+  // invalidate cached recv sizes — ghosting topology (and thus message sizes) has changed
+  refresh_specific_recv_sizes_cache_.clear();
 
   // cache procs to which we send refreshed particle data
   refresh_send_procs_.clear();
