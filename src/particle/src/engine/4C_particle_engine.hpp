@@ -629,6 +629,17 @@ namespace Particle
         std::vector<int>* out_recv_sizes = nullptr) const;
 
     /*!
+     * \brief compute receive sizes for refresh-specific locally (no MPI round-trip)
+     *
+     * Determines, for each sender in refresh_recv_procs_, the byte size of the refresh-specific
+     * message we will receive from that sender. Uses the per-(sender,type) ghost particle counts
+     * recorded during the last ghost rebuild, multiplied by the deterministic per-particle pack
+     * size derived from the requested StatesOfTypesToRefresh pattern.
+     */
+    std::vector<int> compute_refresh_specific_recv_sizes(
+        const StatesOfTypesToRefresh& particlestatestotypes) const;
+
+    /*!
      * \brief communicate and build map for direct ghosting
      *
      * Communicate the information at which local index in the particle container a particle at the
@@ -735,9 +746,6 @@ namespace Particle
     //! relate potential particle neighbors of all types and statuses
     PotentialParticleNeighbors potentialparticleneighbors_;
 
-    //! accumulated interaction pair count per bin global id for load balancing weight estimation
-    std::unordered_map<int, double> bin_interaction_costs_;
-
     //! owned particles being communicated (transfered/distributed) to target processors
     std::vector<std::vector<int>> communicatedparticletargets_;
 
@@ -777,6 +785,11 @@ namespace Particle
     //! cached recv sizes per StatesOfTypesToRefresh pattern (indexed by position in
     //! refresh_recv_procs_); invalidated whenever the ghosting topology is rebuilt
     mutable std::map<StatesOfTypesToRefresh, std::vector<int>> refresh_specific_recv_sizes_cache_;
+
+    //! per-(sender proc, particle type) number of ghost particles received from that sender
+    //! during the last ghost rebuild; used to compute refresh-specific recv sizes locally
+    //! without an MPI round-trip
+    std::map<int, std::map<ParticleType, int>> ghost_count_from_proc_;
   };
 
 }  // namespace Particle

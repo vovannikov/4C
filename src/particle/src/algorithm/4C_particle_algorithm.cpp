@@ -134,7 +134,7 @@ void Particle::ParticleAlgorithm::setup()
   // setup initial rigid bodies
   if (particlerigidbody_) setup_initial_rigid_bodies();
 
-  // distribute load among processors (first pass: by particle count)
+  // distribute load among processors
   distribute_load_among_procs();
 
   // ghost particles on other processors
@@ -143,20 +143,8 @@ void Particle::ParticleAlgorithm::setup()
   // build global id to local index map
   particleengine_->build_global_id_to_local_index_map();
 
-  // build potential neighbor relation — populates bin_interaction_costs_ for cost-aware rebalancing
+  // build potential neighbor relation
   if (particleinteraction_) build_potential_neighbor_relation();
-
-  // second redistribution pass: redistribute load using interaction-pair counts as bin weights
-  // now that bin_interaction_costs_ is available from the neighbor build above
-  if (particleinteraction_)
-  {
-    distribute_load_among_procs();
-
-    // re-ghost and rebuild after second redistribution
-    particleengine_->ghost_particles();
-    particleengine_->build_global_id_to_local_index_map();
-    build_potential_neighbor_relation();
-  }
 
   // setup initial states
   if (not isrestarted_) setup_initial_states();

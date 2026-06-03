@@ -30,6 +30,7 @@
 #include <Teuchos_TimeMonitor.hpp>
 
 #include <memory>
+#include <unordered_map>
 
 FOUR_C_NAMESPACE_OPEN
 
@@ -368,18 +369,18 @@ void Particle::ParticleEngine::refresh_particles_of_specific_states_and_types(
   std::map<int, std::vector<char>> sdata;
   pack_specific_states_of_particles_to_be_refreshed(particlestatestotypes, sdata);
 
-  // look up cached recv sizes for this state combination to skip the size-exchange round-trip
+  // look up cached recv sizes for this state combination; on miss, compute them locally
+  // (no MPI round-trip) from the per-(sender,type) ghost counts recorded during the last
+  // ghost rebuild and the deterministic per-particle pack size of the requested pattern.
   auto it = refresh_specific_recv_sizes_cache_.find(particlestatestotypes);
-  if (it != refresh_specific_recv_sizes_cache_.end())
+  if (it == refresh_specific_recv_sizes_cache_.end())
   {
-    communicate_refreshed_particles(sdata, &it->second, nullptr);
+    it = refresh_specific_recv_sizes_cache_
+             .emplace(
+                 particlestatestotypes, compute_refresh_specific_recv_sizes(particlestatestotypes))
+             .first;
   }
-  else
-  {
-    std::vector<int> recv_sizes;
-    communicate_refreshed_particles(sdata, nullptr, &recv_sizes);
-    refresh_specific_recv_sizes_cache_[particlestatestotypes] = std::move(recv_sizes);
-  }
+  communicate_refreshed_particles(sdata, &it->second, nullptr);
 }
 
 void Particle::ParticleEngine::dynamic_load_balancing()
@@ -474,9 +475,8 @@ void Particle::ParticleEngine::build_particle_to_particle_neighbors()
   // relate half neighboring bins to owned bins
   if (not binning_->validhalfneighboringbins_) relate_half_neighboring_bins_to_owned_bins();
 
-  // clear potential particle neighbors and accumulated interaction costs
+  // clear potential particle neighbors
   potentialparticleneighbors_.clear();
-  bin_interaction_costs_.clear();
 
   // invalidate flag denoting validity of particle neighbors map
   validparticleneighbors_ = false;
@@ -561,9 +561,6 @@ void Particle::ParticleEngine::build_particle_to_particle_neighbors()
           potentialparticleneighbors_.push_back(
               std::make_pair(std::make_tuple(type, Owned, ownedindex),
                   std::make_tuple(neighbortype, neighborstatus, neighborindex)));
-
-          // accumulate interaction cost for load balancing weight estimation
-          bin_interaction_costs_[gidofbin] += 1.0;
         }
       }
     }
@@ -1767,6 +1764,8 @@ void Particle::ParticleEngine::communicate_refreshed_particles(
     std::map<int, std::vector<char>>& sdata, const std::vector<int>* known_recv_sizes,
     std::vector<int>* out_recv_sizes) const
 {
+  TEUCHOS_FUNC_TIME_MONITOR("Particle::ParticleEngine::communicate_refreshed_particles");
+
   const int numsendtoprocs = static_cast<int>(refresh_send_procs_.size());
   const int numrecvfromprocs = static_cast<int>(refresh_recv_procs_.size());
 
@@ -1791,8 +1790,8 @@ void Particle::ParticleEngine::communicate_refreshed_particles(
       {
         auto it = sdata.find(torank);
         msgsizestosend[counter] = (it != sdata.end()) ? static_cast<int>(it->second.size()) : 0;
-        MPI_Isend(&msgsizestosend[counter], 1, MPI_INT, torank, 1234, comm_,
-            &sizesendrequest[counter]);
+        MPI_Isend(
+            &msgsizestosend[counter], 1, MPI_INT, torank, 1234, comm_, &sizesendrequest[counter]);
         ++counter;
       }
     }
@@ -1800,8 +1799,7 @@ void Particle::ParticleEngine::communicate_refreshed_particles(
     // receive size of messages from ALL known senders
     std::vector<MPI_Request> sizerecvrequest(numrecvfromprocs);
     for (int i = 0; i < numrecvfromprocs; ++i)
-      MPI_Irecv(
-          &msgsizestorecv[i], 1, MPI_INT, recvsources[i], 1234, comm_, &sizerecvrequest[i]);
+      MPI_Irecv(&msgsizestorecv[i], 1, MPI_INT, recvsources[i], 1234, comm_, &sizerecvrequest[i]);
 
     MPI_Waitall(numrecvfromprocs, sizerecvrequest.data(), MPI_STATUSES_IGNORE);
 
@@ -1841,10 +1839,14 @@ void Particle::ParticleEngine::communicate_refreshed_particles(
   }
 
   // wait for completion
-  if (!sendrequest.empty())
-    MPI_Waitall(static_cast<int>(sendrequest.size()), sendrequest.data(), MPI_STATUSES_IGNORE);
-  sdata.clear();
-  MPI_Waitall(numrecvfromprocs, recvrequest.data(), MPI_STATUSES_IGNORE);
+  {
+    TEUCHOS_FUNC_TIME_MONITOR(
+        "Particle::ParticleEngine::communicate_refreshed_particles::wait_for_completion");
+    if (!sendrequest.empty())
+      MPI_Waitall(static_cast<int>(sendrequest.size()), sendrequest.data(), MPI_STATUSES_IGNORE);
+    sdata.clear();
+    MPI_Waitall(numrecvfromprocs, recvrequest.data(), MPI_STATUSES_IGNORE);
+  }
 
   // unpack received data directly into ghosted particle containers
   for (const auto& p : rdata)
@@ -1873,6 +1875,62 @@ void Particle::ParticleEngine::communicate_refreshed_particles(
       container->replace_particle(ghostedindex, -1, states);
     }
   }
+}
+
+std::vector<int> Particle::ParticleEngine::compute_refresh_specific_recv_sizes(
+    const StatesOfTypesToRefresh& particlestatestotypes) const
+{
+  // Determine the deterministic per-particle pack size for each particle type that appears in
+  // the requested pattern. This must mirror exactly what pack_specific_states_of_particles_to_-
+  // be_refreshed writes per particle: a header [int type, int ghostedindex] followed by a
+  // ParticleStates vector with the requested states filled (others empty).
+  std::map<ParticleType, int> per_particle_size;
+  for (const auto& [type, stateset] : particlestatestotypes)
+  {
+    if (stateset.empty())
+    {
+      per_particle_size[type] = 0;
+      continue;
+    }
+
+    const int statesvectorsize = *std::max_element(stateset.begin(), stateset.end()) + 1;
+
+    ParticleContainer* container = particlecontainerbundle_->get_specific_container(type, Owned);
+
+    // build a single dummy particle states vector matching the pack layout used by
+    // pack_specific_states_of_particles_to_be_refreshed
+    ParticleStates dummy;
+    dummy.assign(statesvectorsize, std::vector<double>(0));
+    for (const auto& state : stateset) dummy[state].assign(container->get_state_dim(state), 0.0);
+
+    Core::Communication::PackBuffer statesdata;
+    add_to_pack(statesdata, dummy);
+
+    Core::Communication::PackBuffer header;
+    add_to_pack(header, static_cast<int>(type));
+    add_to_pack(header, 0);  // dummy ghosted index
+
+    per_particle_size[type] = static_cast<int>(header().size() + statesdata().size());
+  }
+
+  // sum up bytes received from each sender as Sum_type ghost_count[sender][type] * size_per[type]
+  std::vector<int> recv_sizes;
+  recv_sizes.reserve(refresh_recv_procs_.size());
+  for (int sender : refresh_recv_procs_)
+  {
+    int bytes = 0;
+    auto pit = ghost_count_from_proc_.find(sender);
+    if (pit != ghost_count_from_proc_.end())
+    {
+      for (const auto& [type, size_per] : per_particle_size)
+      {
+        auto cit = pit->second.find(type);
+        if (cit != pit->second.end()) bytes += cit->second * size_per;
+      }
+    }
+    recv_sizes.push_back(bytes);
+  }
+  return recv_sizes;
 }
 
 void Particle::ParticleEngine::communicate_direct_ghosting_map(
@@ -1917,8 +1975,7 @@ void Particle::ParticleEngine::communicate_direct_ghosting_map(
     for (int torank : ghost_recv_procs_)
     {
       auto it = sdata.find(torank);
-      msgsizestosend_dgm[counter] =
-          (it != sdata.end()) ? static_cast<int>(it->second.size()) : 0;
+      msgsizestosend_dgm[counter] = (it != sdata.end()) ? static_cast<int>(it->second.size()) : 0;
       MPI_Isend(&msgsizestosend_dgm[counter], 1, MPI_INT, torank, 1234, comm_,
           &sizesendrequest_dgm[counter]);
       ++counter;
@@ -2082,6 +2139,9 @@ void Particle::ParticleEngine::communicate_and_insert_ghost_particles(
     std::map<int, std::vector<char>>& sdata,
     std::map<int, std::map<ParticleType, std::map<int, std::pair<int, int>>>>& directghosting)
 {
+  // reset per-(sender,type) ghost counts; they will be re-populated during unpack below
+  ghost_count_from_proc_.clear();
+
   const int numsendtoprocs = static_cast<int>(ghost_send_procs_.size());
   const int numrecvfromprocs = static_cast<int>(ghost_recv_procs_.size());
 
@@ -2168,7 +2228,8 @@ void Particle::ParticleEngine::communicate_and_insert_ghost_particles(
       ParticleType type = static_cast<ParticleType>(type_int);
 
       // get container of ghosted particles of current particle type
-      ParticleContainer* container = particlecontainerbundle_->get_specific_container(type, Ghosted);
+      ParticleContainer* container =
+          particlecontainerbundle_->get_specific_container(type, Ghosted);
 
       // add particle to container of ghosted particles
       int ghostedindex(0);
@@ -2177,6 +2238,10 @@ void Particle::ParticleEngine::communicate_and_insert_ghost_particles(
       // add index relating (owned and ghosted) particles to col bins
       particlestobins_[binning_->bincolmap_->lid(bingid)].push_back(
           std::make_pair(type, ghostedindex));
+
+      // record ghost particle count per (sender proc, particle type) for later use in
+      // computing refresh-specific recv sizes locally without an MPI round-trip
+      ++ghost_count_from_proc_[sendingproc][type];
 
       // insert necessary information for direct ghosting map
       (((directghosting[sendingproc])[type])[ownedindex]) = std::make_pair(myrank_, ghostedindex);
@@ -2315,28 +2380,60 @@ void Particle::ParticleEngine::determine_bin_weights()
   // safety check
   if (not validownedparticles_) FOUR_C_THROW("invalid relation of owned particles to bins!");
 
+  // per-pair contribution weight. Pair-list iteration dominates the SPH compute
+  // kernels (ComputeDensity, momentum, etc.), so adding a pair-count term to the bin
+  // weights gives a much better predictor of actual work than a particle-count-only
+  // metric. The factor scales pair cost relative to per-particle setup cost; 1.0 is
+  // a reasonable default since both kernel families have comparable per-element cost.
+  // Tune here if needed; promoting to an input parameter is a follow-up.
+  constexpr double pair_weight_factor = 1.0;
+
+  const int nrowbins = binning_->binrowmap_->num_my_elements();
+
   // initialize weights of all bins
   binning_->binweights_->put_scalar(1.0e-05);
 
-  // loop over row bins
-  for (int rowlidofbin = 0; rowlidofbin < binning_->binrowmap_->num_my_elements(); ++rowlidofbin)
+  double* const weights = binning_->binweights_->get_vector(0).get_values();
+
+  // particle-count contribution (per-particle type-weighted setup cost)
+  for (int rowlidofbin = 0; rowlidofbin < nrowbins; ++rowlidofbin)
   {
     // get global id of bin
     const int gidofbin = binning_->binrowmap_->gid(rowlidofbin);
 
-    // use neighbor pair count from the previous interaction evaluation as a proxy for the
-    // compute cost of this bin; fall back to particle count × type weight when no interaction
-    // data is available yet (e.g. on the very first load redistribution)
-    auto costIt = bin_interaction_costs_.find(gidofbin);
-    if (costIt != bin_interaction_costs_.end())
+    // iterate over owned particles in current bin
+    for (const auto& particleIt : particlestobins_[binning_->bincolmap_->lid(gidofbin)])
     {
-      binning_->binweights_->get_vector(0).get_values()[rowlidofbin] += costIt->second;
+      // add weight of particle of specific type
+      weights[rowlidofbin] += typeweights_[particleIt.first];
     }
-    else
+  }
+
+  // pair-count contribution: attribute each pair (i,j) to bin-of-i with weight 2.
+  // The factor 2 reflects that the SPH kernels iterate over the pair list once but
+  // accumulate symmetrically into both i and j; both half-contributions are work done
+  // on this rank and charged here to bin-of-i (a conservative but well-correlated proxy
+  // that avoids the extra reverse lookup for ghosted j). Only applied when the pair
+  // list is currently valid; otherwise the particle-count fallback above is used.
+  if (validparticleneighbors_)
+  {
+    // build owned-particle (type, ownedindex) -> rowlid lookup from the row-bin entries
+    // of particlestobins_. Row bins contain only owned particles by construction.
+    std::vector<std::unordered_map<int, int>> owned_to_rowlid(typevectorsize_);
+    for (int rowlidofbin = 0; rowlidofbin < nrowbins; ++rowlidofbin)
     {
-      for (const auto& particleIt : particlestobins_[binning_->bincolmap_->lid(gidofbin)])
-        binning_->binweights_->get_vector(0).get_values()[rowlidofbin] +=
-            typeweights_[particleIt.first];
+      const int collid = binning_->bincolmap_->lid(binning_->binrowmap_->gid(rowlidofbin));
+      for (const auto& [type, idx] : particlestobins_[collid])
+        owned_to_rowlid[type][idx] = rowlidofbin;
+    }
+
+    const double per_pair = 2.0 * pair_weight_factor;
+    for (const auto& pair : potentialparticleneighbors_)
+    {
+      // i is always owned by construction of build_particle_to_particle_neighbors
+      const auto& [itype, istatus, iindex] = pair.first;
+      auto mit = owned_to_rowlid[itype].find(iindex);
+      if (mit != owned_to_rowlid[itype].end()) weights[mit->second] += per_pair;
     }
   }
 }
