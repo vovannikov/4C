@@ -84,6 +84,18 @@ std::vector<Core::IO::InputSpec> Particle::valid_parameters()
               "TRANSFER_EVERY", {.description = "transfer particles to new bins every time step",
                                     .default_value = false}),
 
+          // Verlet skin factor for tight neighbor-list reuse (B). The pair search radius
+          // becomes max_interaction_distance * (1 + VERLET_SKIN_FACTOR). Allows the
+          // potential-neighbor list to be reused across multiple steps as long as no
+          // particle has moved more than half the resulting skin since the list was built.
+          // A value of 0 disables Verlet reuse and preserves legacy behavior (list filter
+          // at min_bin_size). Effective only when min_bin_size > R_max * (1 + factor);
+          // otherwise the radius is silently clamped to min_bin_size and Verlet reuse is
+          // disabled (no benefit possible given the chosen bin size).
+          parameter<double>("VERLET_SKIN_FACTOR",
+              {.description = "Verlet skin factor (skin = R_max * factor); 0 disables Verlet reuse",
+                  .default_value = 0.2}),
+
           // considered particle phases with dynamic load balance weighting factor
           parameter<std::string>("PHASE_TO_DYNLOADBALFAC",
               {.description =

@@ -35,10 +35,12 @@ namespace Particle
   {
     /*---------------------------------------------------------------------------*/
     // default particle states
-    Position,              //!< position
-    Velocity,              //!< velocity
-    Acceleration,          //!< acceleration
-    LastTransferPosition,  //!< position after last particle transfer
+    Position,                       //!< position
+    Velocity,                       //!< velocity
+    Acceleration,                   //!< acceleration
+    LastTransferPosition,           //!< position after last particle transfer
+    LastNeighborListBuildPosition,  //!< position after last neighbor-list build (Verlet skin
+                                    //!< reference)
     /*---------------------------------------------------------------------------*/
     // particle states for advanced time integration schemes
     ModifiedVelocity,      //!< modified velocity

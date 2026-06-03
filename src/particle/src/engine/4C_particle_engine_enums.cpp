@@ -51,6 +51,7 @@ int Particle::enum_to_state_dim(const ParticleState& state)
     case Velocity:
     case Acceleration:
     case LastTransferPosition:
+    case LastNeighborListBuildPosition:
     case ModifiedVelocity:
     case ModifiedAcceleration:
     case ReferencePosition:
@@ -140,6 +141,9 @@ std::string Particle::enum_to_state_name(const ParticleState& state)
       break;
     case LastTransferPosition:
       name = "position last transfer";
+      break;
+    case LastNeighborListBuildPosition:
+      name = "position last neighbor list build";
       break;
     case ReferencePosition:
       name = "reference position";

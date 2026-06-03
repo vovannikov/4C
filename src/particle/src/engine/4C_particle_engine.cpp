@@ -48,7 +48,8 @@ Particle::ParticleEngine::ParticleEngine(MPI_Comm comm, const Teuchos::Parameter
       validghostedparticles_(false),
       validparticleneighbors_(false),
       validglobalidtolocalindex_(false),
-      validdirectghosting_(false)
+      validdirectghosting_(false),
+      verlet_skin_factor_(params.get<double>("VERLET_SKIN_FACTOR"))
 {
   // init binning strategy
   init_binning_strategy();
@@ -580,9 +581,12 @@ void Particle::ParticleEngine::build_particle_to_particle_neighbors()
           // distance between particles considering periodic boundaries
           distance_between_particles(currpos, neighborpos, dist);
 
-          // distance between particles larger than minimum bin size
-          if (dist[0] * dist[0] + dist[1] * dist[1] + dist[2] * dist[2] >
-              (binning_->minbinsize_ * binning_->minbinsize_))
+          // distance between particles larger than configured pair-search radius (Verlet)
+          // or, when Verlet reuse is disabled, larger than the minimum bin size (legacy).
+          const double threshold_sq = verlet_active_
+              ? (pair_search_radius_ * pair_search_radius_)
+              : (binning_->minbinsize_ * binning_->minbinsize_);
+          if (dist[0] * dist[0] + dist[1] * dist[1] + dist[2] * dist[2] > threshold_sq)
             continue;
 
           // append potential particle neighbor pair
@@ -596,6 +600,72 @@ void Particle::ParticleEngine::build_particle_to_particle_neighbors()
 
   // validate flag denoting validity of particle neighbors map
   validparticleneighbors_ = true;
+
+  // snapshot positions for Verlet skin tracking (Light gate reference)
+  if (verlet_active_) store_positions_after_neighbor_list_build();
+}
+
+void Particle::ParticleEngine::rebuild_potential_neighbors_only()
+{
+  // Verlet Light-gate path: rebuild the neighbor list locally without redoing
+  // ghosting / global-id map / load balance. build_particle_to_particle_neighbors
+  // is already a purely local operation that consumes the (still valid) ghost
+  // positions refreshed each step by refresh_particles().
+  build_particle_to_particle_neighbors();
+}
+
+void Particle::ParticleEngine::configure_verlet_pair_search_radius(
+    const double max_interaction_distance)
+{
+  const double requested = max_interaction_distance * (1.0 + verlet_skin_factor_);
+  const double minbin = binning_->minbinsize_;
+
+  // pair_search_radius must not exceed min_bin_size: the 3x3x3 bin scan is only
+  // complete out to distance min_bin_size, so accepting pairs beyond would risk
+  // missing equally-distant pairs sitting in a bin outside the scan window.
+  pair_search_radius_ = std::min(requested, minbin);
+
+  // Verlet reuse is meaningful only when there is a real skin budget separate from
+  // the existing bin-margin used by the Heavy gate. If the radius was clamped to
+  // min_bin_size, the effective skin equals the Heavy-gate margin and Light-gate
+  // rebuilds would fire together with the Heavy gate (no benefit). In that case
+  // we keep the legacy filter at min_bin_size to remain bit-equivalent.
+  const bool real_skin_budget = (verlet_skin_factor_ > 0.0) && (requested < minbin);
+  verlet_active_ = real_skin_budget;
+  verlet_skin_ = verlet_active_ ? (pair_search_radius_ - max_interaction_distance) : 0.0;
+
+  if (myrank_ == 0)
+  {
+    if (verlet_active_)
+    {
+      Core::IO::cout << "Verlet neighbor-list reuse active: pair_search_radius="
+                     << pair_search_radius_ << " (skin=" << verlet_skin_
+                     << ", min_bin_size=" << minbin
+                     << ", R_max=" << max_interaction_distance << ")" << Core::IO::endl;
+    }
+    else if (verlet_skin_factor_ > 0.0)
+    {
+      Core::IO::cout << "Verlet neighbor-list reuse requested but bins are too small "
+                        "(min_bin_size="
+                     << minbin << " <= R_max*(1+skin)=" << requested
+                     << "); falling back to legacy filter at min_bin_size." << Core::IO::endl;
+    }
+  }
+}
+
+void Particle::ParticleEngine::store_positions_after_neighbor_list_build()
+{
+  for (const auto& type : particlecontainerbundle_->get_particle_types())
+  {
+    ParticleContainer* container = particlecontainerbundle_->get_specific_container(type, Owned);
+    const int particlestored = container->particles_stored();
+    if (particlestored == 0) continue;
+
+    const double* pos = container->get_ptr_to_state(Position, 0);
+    double* lastbuildpos = container->get_ptr_to_state(LastNeighborListBuildPosition, 0);
+    const int statedim = container->get_state_dim(Position);
+    for (int i = 0; i < (statedim * particlestored); ++i) lastbuildpos[i] = pos[i];
+  }
 }
 
 void Particle::ParticleEngine::build_global_id_to_local_index_map()

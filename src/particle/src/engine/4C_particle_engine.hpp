@@ -260,6 +260,42 @@ namespace Particle
     void build_particle_to_particle_neighbors();
 
     /*!
+     * \brief rebuild the potential particle-to-particle neighbor list only (Verlet path)
+     *
+     * Local-only rebuild of potentialparticleneighbors_ that does not touch ghosting,
+     * the global-id map or load balancing. Intended for the Light-gate path of
+     * update_connectivity when only the neighbor list needs refreshing because
+     * particles have moved more than skin/2 since the last build but less than the
+     * full transfer threshold.
+     */
+    void rebuild_potential_neighbors_only();
+
+    /*!
+     * \brief configure Verlet pair-search radius (B).
+     *
+     * Sets the radius used to filter pairs when building potentialparticleneighbors_.
+     * The desired radius is max_interaction_distance * (1 + skin_factor); the actual
+     * radius is clamped to min_bin_size to guarantee the 3x3x3 bin scan is complete.
+     * If the clamp triggers (or skin_factor == 0) Verlet reuse is disabled and the
+     * legacy filter at min_bin_size is preserved bit-for-bit.
+     *
+     * \param[in] max_interaction_distance maximum particle interaction distance R_max
+     */
+    void configure_verlet_pair_search_radius(double max_interaction_distance);
+
+    /*!
+     * \brief test whether Verlet neighbor-list reuse is active.
+     */
+    bool verlet_active() const { return verlet_active_; }
+
+    /*!
+     * \brief get the half-skin distance used to gate Light-path rebuilds.
+     *
+     * Returns 0 when Verlet reuse is disabled.
+     */
+    double verlet_rebuild_threshold() const { return verlet_active_ ? 0.5 * verlet_skin_ : 0.0; }
+
+    /*!
      * \brief build global id to local index map
      *
      * Relate the global id of all particles to the local index as stored in the particle container.
@@ -700,6 +736,14 @@ namespace Particle
     void store_positions_after_particle_transfer();
 
     /*!
+     * \brief store particle positions after a neighbor-list (re)build
+     *
+     * Snapshots Position into LastNeighborListBuildPosition for all owned particles
+     * of all types. Reference snapshot for the Verlet skin displacement check.
+     */
+    void store_positions_after_neighbor_list_build();
+
+    /*!
      * \brief relate owned particles to bins
      *
      */
@@ -814,6 +858,23 @@ namespace Particle
     //! during the last ghost rebuild; used to compute refresh-specific recv sizes locally
     //! without an MPI round-trip
     std::map<int, std::map<ParticleType, int>> ghost_count_from_proc_;
+
+    //! Verlet skin factor (B): pair search radius = R_max * (1 + factor); 0 disables
+    double verlet_skin_factor_{0.0};
+
+    //! pair-search radius used to filter potentialparticleneighbors_ entries;
+    //! initialized by configure_verlet_pair_search_radius. When Verlet reuse is
+    //! disabled this equals min_bin_size so the filter is a no-op vs legacy code.
+    double pair_search_radius_{0.0};
+
+    //! effective skin = pair_search_radius_ - R_max (>= 0); only meaningful when
+    //! verlet_active_ == true.
+    double verlet_skin_{0.0};
+
+    //! true iff verlet_skin_factor_ > 0 AND the clamp to min_bin_size did not
+    //! reduce the requested radius (i.e. a real skin budget exists beyond the
+    //! bin-margin already used by the Heavy gate).
+    bool verlet_active_{false};
   };
 
 }  // namespace Particle

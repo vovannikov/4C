@@ -315,6 +315,26 @@ namespace Particle
     double get_max_particle_position_increment();
 
     /*!
+     * \brief get maximum particle displacement since last neighbor-list build
+     *
+     * Used by the Verlet Light-gate path of update_connectivity. Mirrors
+     * get_max_particle_position_increment but references LastNeighborListBuildPosition
+     * instead of LastTransferPosition. Does an MPI_max_all.
+     *
+     * \return maximum displacement of any owned particle on any proc since the last
+     *         neighbor-list build
+     */
+    double get_max_particle_displacement_since_neighbor_build();
+
+    /*!
+     * \brief check whether the potential-neighbor list must be rebuilt (Light gate)
+     *
+     * Returns true when Verlet reuse is active AND the displacement since the last
+     * neighbor-list build exceeds half the skin width.
+     */
+    bool check_neighbor_list_rebuild_needed();
+
+    /*!
      * \brief transfer load between processors
      *
      */

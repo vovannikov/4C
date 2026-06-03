@@ -33,7 +33,7 @@ void Particle::ParticleRuntimeVtpWriter::init(
   // insert specific particle states in black list
   blackliststates_.insert({DensitySum, DensityDot});
   blackliststates_.insert(TemperatureDot);
-  blackliststates_.insert({LastTransferPosition, ReferencePosition});
+  blackliststates_.insert({LastTransferPosition, LastNeighborListBuildPosition, ReferencePosition});
   blackliststates_.insert({ModifiedVelocity, ModifiedAcceleration});
   blackliststates_.insert({InterfaceNormal, Curvature, WallColorfield, WallInterfaceNormal});
   blackliststates_.insert({LastIterPosition, LastIterVelocity, LastIterAcceleration,

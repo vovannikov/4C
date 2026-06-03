@@ -155,6 +155,11 @@ void Particle::ParticleAlgorithm::setup()
     // particle radii, etc.) and never changes at runtime.
     cached_allproc_max_interaction_distance_ =
         Core::Communication::max_all(particleinteraction_->max_interaction_distance(), get_comm());
+
+    // Configure Verlet pair-search radius (B). Done here because both R_max and
+    // min_bin_size are init-time invariants and ParticleEngine needs both to decide
+    // the actual radius and whether reuse is feasible.
+    particleengine_->configure_verlet_pair_search_radius(cached_allproc_max_interaction_distance_);
   }
 
   // ghost particles on other processors
@@ -590,7 +595,7 @@ void Particle::ParticleAlgorithm::determine_particle_states_of_particle_types()
 
     // insert default particle states
     particlestates.insert({Particle::Position, Particle::Velocity, Particle::Acceleration,
-        Particle::LastTransferPosition});
+        Particle::LastTransferPosition, Particle::LastNeighborListBuildPosition});
   }
 
   // insert integration dependent states of all particle types
@@ -708,6 +713,15 @@ void Particle::ParticleAlgorithm::update_connectivity()
   {
     // refresh particles being ghosted on other processors
     particleengine_->refresh_particles();
+
+    // Verlet Light-gate path (B): if particles have drifted more than skin/2 since
+    // the last neighbor-list build, rebuild the list locally. Skipped (returns false)
+    // when Verlet reuse is disabled, in which case behavior is bit-equivalent to the
+    // pre-Verlet code path.
+    if (particleinteraction_ && check_neighbor_list_rebuild_needed())
+    {
+      particleengine_->rebuild_potential_neighbors_only();
+    }
   }
 }
 
@@ -908,6 +922,52 @@ double Particle::ParticleAlgorithm::get_max_particle_position_increment()
       Core::Communication::max_all(maxpositionincrement, get_comm());
 
   return allprocmaxpositionincrement;
+}
+
+bool Particle::ParticleAlgorithm::check_neighbor_list_rebuild_needed()
+{
+  if (!particleengine_->verlet_active()) return false;
+
+  const double threshold = particleengine_->verlet_rebuild_threshold();
+  const double maxdisp = get_max_particle_displacement_since_neighbor_build();
+  return (maxdisp > threshold);
+}
+
+double Particle::ParticleAlgorithm::get_max_particle_displacement_since_neighbor_build()
+{
+  // Local max displacement since LastNeighborListBuildPosition snapshot.
+  // Periodic boundaries handled via distance_between_particles, mirroring
+  // get_max_particle_position_increment.
+  double maxdisp = 0.0;
+
+  Particle::ParticleContainerBundleShrdPtr particlecontainerbundle =
+      particleengine_->get_particle_container_bundle();
+
+  for (const auto& typeEnum : particlecontainerbundle->get_particle_types())
+  {
+    Particle::ParticleContainer* container =
+        particlecontainerbundle->get_specific_container(typeEnum, Particle::Owned);
+    const int particlestored = container->particles_stored();
+    if (particlestored == 0) continue;
+
+    const int statedim = container->get_state_dim(Particle::Position);
+    double disp[3];
+
+    for (int i = 0; i < particlestored; ++i)
+    {
+      const double* pos = container->get_ptr_to_state(Particle::Position, i);
+      const double* lastbuildpos =
+          container->get_ptr_to_state(Particle::LastNeighborListBuildPosition, i);
+      particleengine_->distance_between_particles(pos, lastbuildpos, disp);
+      for (int d = 0; d < statedim; ++d) maxdisp = std::max(maxdisp, std::abs(disp[d]));
+    }
+  }
+
+  // Single MPI_max_all over a 1-element value. Only invoked in the else-branch
+  // of update_connectivity (i.e. steps where the Heavy gate did not fire), so the
+  // per-step collective count remains 1 in the typical case and 2 only on steps
+  // where the Light gate fires after the Heavy gate cleared.
+  return Core::Communication::max_all(maxdisp, get_comm());
 }
 
 void Particle::ParticleAlgorithm::transfer_load_between_procs()
