@@ -137,6 +137,26 @@ void Particle::ParticleAlgorithm::setup()
   // distribute load among processors
   distribute_load_among_procs();
 
+  // check particle interaction distance concerning bin size. This compares the
+  // (radius-driven) max interaction distance against the (init-time) min bin size
+  // and against the periodic domain lengths. All of those quantities are determined
+  // during init/setup and never change at runtime, so a single one-shot check here
+  // is sufficient. Previously this lived inside update_connectivity, where its
+  // MPI_max_all became a per-step collective barrier that absorbed all upstream
+  // load imbalance (~16 s mean / 38 s max accumulated wait time at 64 ranks /
+  // 200 steps in benchmarks).
+  if (particleinteraction_)
+  {
+    particleinteraction_->check_particle_interaction_distance_concerning_bin_size();
+
+    // R6b: cache the all-proc max interaction distance once here so that
+    // check_max_position_increment() can avoid a per-step MPI_Allreduce.
+    // max_interaction_distance() is an init-time invariant (kernel support radius,
+    // particle radii, etc.) and never changes at runtime.
+    cached_allproc_max_interaction_distance_ =
+        Core::Communication::max_all(particleinteraction_->max_interaction_distance(), get_comm());
+  }
+
   // ghost particles on other processors
   particleengine_->ghost_particles();
 
@@ -660,9 +680,9 @@ void Particle::ParticleAlgorithm::update_connectivity()
   particleengine_->check_number_of_unique_global_ids();
 #endif
 
-  // check particle interaction distance concerning bin size
-  if (particleinteraction_)
-    particleinteraction_->check_particle_interaction_distance_concerning_bin_size();
+  // NOTE: check_particle_interaction_distance_concerning_bin_size has been moved
+  // to setup() (one-shot) since all quantities it inspects are init-time invariants
+  // and the per-step MPI_max_all collective absorbed substantial load-imbalance wait.
 
   // check that wall nodes are located in bounding box
   if (particlewall_) particlewall_->check_wall_nodes_located_in_bounding_box();
@@ -713,14 +733,13 @@ bool Particle::ParticleAlgorithm::check_load_transfer_needed()
 
 bool Particle::ParticleAlgorithm::check_max_position_increment()
 {
-  // get maximum particle interaction distance
-  double allprocmaxinteractiondistance = 0.0;
-  if (particleinteraction_)
-  {
-    double maxinteractiondistance = particleinteraction_->max_interaction_distance();
-    allprocmaxinteractiondistance =
-        Core::Communication::max_all(maxinteractiondistance, get_comm());
-  }
+  // R6b: reuse the value cached once in setup() instead of performing a per-step
+  // MPI_Allreduce. max_interaction_distance() depends only on init-time invariants
+  // (kernel support radius, particle radii, etc.) and therefore does not change at
+  // runtime. The previous per-step max_all collective absorbed substantial
+  // load-imbalance wait time (~18 s mean / 40 s max at 64 ranks / 200 steps).
+  const double allprocmaxinteractiondistance =
+      particleinteraction_ ? cached_allproc_max_interaction_distance_ : 0.0;
 
   // get max particle position increment since last transfer
   double maxparticlepositionincrement = get_max_particle_position_increment();

@@ -415,6 +415,12 @@ namespace Particle
     //! number of particles on this processor after last load balance
     int numparticlesafterlastloadbalance_;
 
+    //! cached all-processor maximum particle interaction distance (R6b).
+    //! Computed once during setup() because max_interaction_distance() is an
+    //! init-time invariant. Reused in check_max_position_increment() to avoid a
+    //! per-step MPI_Allreduce that otherwise absorbed load-imbalance wait time.
+    double cached_allproc_max_interaction_distance_{0.0};
+
     //! transfer particles to new bins every time step
     bool transferevery_;
 
