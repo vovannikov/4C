@@ -731,6 +731,15 @@ namespace Particle
     //! vector of particle type weights for dynamic load balancing
     std::vector<double> typeweights_;
 
+    //! per row-bin neighbor-search cost recorded during the most recent
+    //! build_particle_to_particle_neighbors call. Each entry holds the number of
+    //! candidate-pair iterations performed for that bin (i.e. number of owned
+    //! particles in the bin times the total particle count across its half-neighbor
+    //! bins). Used as an additive contribution to bin weights in determine_bin_weights
+    //! to balance the neighbor-search kernel, which is the dominant cost within
+    //! update_connectivity. Only consumed when validparticleneighbors_ is true.
+    std::vector<double> last_search_cost_per_rowbin_;
+
     //! particle container bundle
     ParticleContainerBundleShrdPtr particlecontainerbundle_;
 

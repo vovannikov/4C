@@ -481,8 +481,13 @@ void Particle::ParticleEngine::build_particle_to_particle_neighbors()
   // invalidate flag denoting validity of particle neighbors map
   validparticleneighbors_ = false;
 
+  // initialize per row-bin neighbor-search cost accumulator (R5 load-balance input).
+  // Reset to zero for every row bin so empty/skipped bins record a zero cost.
+  const int nrowbins_local = binning_->binrowmap_->num_my_elements();
+  last_search_cost_per_rowbin_.assign(nrowbins_local, 0.0);
+
   // loop over row bins
-  for (int rowlidofbin = 0; rowlidofbin < binning_->binrowmap_->num_my_elements(); ++rowlidofbin)
+  for (int rowlidofbin = 0; rowlidofbin < nrowbins_local; ++rowlidofbin)
   {
     // get global id of bin
     const int gidofbin = binning_->binrowmap_->gid(rowlidofbin);
@@ -492,6 +497,23 @@ void Particle::ParticleEngine::build_particle_to_particle_neighbors()
 
     // check if current bin contains owned particles
     if (particlestobins_[collidofbin].empty()) continue;
+
+    // record neighbor-search cost for this bin: the inner candidate-pair loop runs
+    // (#owned particles in this bin) x (sum of #particles in all half-neighbor bins)
+    // times. Each iteration performs a constant-cost distance check, so this count is
+    // a direct proxy for build_particle_to_particle_neighbors' cost contribution from
+    // this bin. Stored for consumption by determine_bin_weights at the next LB step.
+    {
+      std::size_t neighbor_particle_total = 0;
+      for (int gidofneighborbin : binning_->halfneighboringbinstobins_[rowlidofbin])
+      {
+        const int collidofneighbor = binning_->bincolmap_->lid(gidofneighborbin);
+        neighbor_particle_total += particlestobins_[collidofneighbor].size();
+      }
+      last_search_cost_per_rowbin_[rowlidofbin] =
+          static_cast<double>(particlestobins_[collidofbin].size()) *
+          static_cast<double>(neighbor_particle_total);
+    }
 
     // iterate over owned particles in current bin
     for (const auto& particleIt : particlestobins_[collidofbin])
@@ -2435,6 +2457,24 @@ void Particle::ParticleEngine::determine_bin_weights()
       auto mit = owned_to_rowlid[itype].find(iindex);
       if (mit != owned_to_rowlid[itype].end()) weights[mit->second] += per_pair;
     }
+  }
+
+  // R5: neighbor-search cost contribution. last_search_cost_per_rowbin_ holds the
+  // measured candidate-pair iteration count per row bin from the most recent
+  // build_particle_to_particle_neighbors call. This balances the neighbor-search
+  // kernel itself (the dominant cost inside update_connectivity, ~85 s mean / 23 s
+  // slack post-R4a) which is driven by pre-cull candidate counts rather than the
+  // post-cull pair counts captured by the R4a term above. The two terms are summed
+  // directly: per-iteration cost is comparable across both kernel families since
+  // both perform a position read plus a distance/kernel evaluation per iteration.
+  // The vector is gated on validparticleneighbors_ since the row-bin map and bin
+  // contents could otherwise be stale relative to the recorded costs.
+  if (validparticleneighbors_ &&
+      last_search_cost_per_rowbin_.size() == static_cast<std::size_t>(nrowbins))
+  {
+    constexpr double search_weight_factor = 1.0;
+    for (int rowlidofbin = 0; rowlidofbin < nrowbins; ++rowlidofbin)
+      weights[rowlidofbin] += search_weight_factor * last_search_cost_per_rowbin_[rowlidofbin];
   }
 }
 
