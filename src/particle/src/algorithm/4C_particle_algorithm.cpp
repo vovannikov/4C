@@ -158,6 +158,9 @@ void Particle::ParticleAlgorithm::setup()
     build_potential_neighbor_relation();
   }
 
+  // print per-type interaction statistics (measured load-balancing weights for this geometry)
+  if (particleinteraction_) particleengine_->print_particle_interaction_statistics();
+
   // setup initial states
   if (not isrestarted_) setup_initial_states();
 

@@ -321,6 +321,18 @@ namespace Particle
 
     const PotentialParticleNeighbors& get_potential_particle_neighbors() const override;
 
+    /*!
+     * \brief print per-type interaction statistics to screen
+     *
+     * \note Diagnostic helper for load-balancing and weak-scaling studies. Aggregates the current
+     * potential particle neighbor relation across all processors and prints, for each particle
+     * type, the global number of particles, the global number of interaction pairs the type
+     * participates in, and the resulting average number of interactions per particle. The latter is
+     * the measured per-particle compute weight and can be used to estimate the relative cost of
+     * each particle type for a given geometry. A pair is counted for both of its endpoints.
+     */
+    void print_particle_interaction_statistics() const;
+
     const std::vector<std::vector<int>>& get_communicated_particle_targets() const override
     {
       return communicatedparticletargets_;

@@ -29,7 +29,9 @@
 
 #include <Teuchos_TimeMonitor.hpp>
 
+#include <iomanip>
 #include <memory>
+#include <sstream>
 
 FOUR_C_NAMESPACE_OPEN
 
@@ -571,6 +573,99 @@ void Particle::ParticleEngine::build_particle_to_particle_neighbors()
 
   // validate flag denoting validity of particle neighbors map
   validparticleneighbors_ = true;
+}
+
+void Particle::ParticleEngine::print_particle_interaction_statistics() const
+{
+  // ordered list of stored particle types
+  std::vector<ParticleType> types(particlecontainerbundle_->get_particle_types().begin(),
+      particlecontainerbundle_->get_particle_types().end());
+
+  // map particle type to a contiguous index for the reduction buffers
+  std::map<ParticleType, std::size_t> type_to_index;
+  for (std::size_t i = 0; i < types.size(); ++i) type_to_index[types[i]] = i;
+
+  // accumulate local interaction-pair count per particle type; each potential neighbor pair
+  // contributes one interaction to the type of each of its two endpoints
+  std::vector<long> interactions(types.size(), 0);
+  for (const auto& neighborpair : potentialparticleneighbors_)
+  {
+    interactions[type_to_index[std::get<0>(neighborpair.first)]] += 1;
+    interactions[type_to_index[std::get<0>(neighborpair.second)]] += 1;
+  }
+
+  // local number of owned particles per type
+  std::vector<long> particlecounts(types.size(), 0);
+  for (std::size_t i = 0; i < types.size(); ++i)
+    particlecounts[i] = static_cast<long>(get_number_of_particles_of_specific_type(types[i]));
+
+  // reduce both quantities to global sums on all processors
+  MPI_Allreduce(MPI_IN_PLACE, interactions.data(), static_cast<int>(interactions.size()), MPI_LONG,
+      MPI_SUM, comm_);
+  MPI_Allreduce(MPI_IN_PLACE, particlecounts.data(), static_cast<int>(particlecounts.size()),
+      MPI_LONG, MPI_SUM, comm_);
+
+  // only the first processor prints the resulting table
+  if (myrank_ != 0) return;
+
+  // total interactions and particles for normalization and shares
+  long total_interactions = 0;
+  long total_particles = 0;
+  for (std::size_t i = 0; i < types.size(); ++i)
+  {
+    total_interactions += interactions[i];
+    total_particles += particlecounts[i];
+  }
+
+  // reference weight (smallest non-zero average) to express weights relative to the cheapest type
+  double reference_weight = 0.0;
+  for (std::size_t i = 0; i < types.size(); ++i)
+  {
+    if (particlecounts[i] == 0) continue;
+    const double weight =
+        static_cast<double>(interactions[i]) / static_cast<double>(particlecounts[i]);
+    if (reference_weight == 0.0 or weight < reference_weight) reference_weight = weight;
+  }
+
+  Core::IO::cout << "\n";
+  // assemble the whole table in a local stream so that field-width formatting is reliable
+  // (Core::IO::cout clears its format buffer on every insertion)
+  std::ostringstream table;
+  const std::string ruler =
+      "+----------------------+-----------------+-------------------+----------------------+-------"
+      "--"
+      "--------+\n";
+  table << ruler;
+  table
+      << "| per-type particle interaction statistics (load-balancing weight estimate)             "
+         "          |\n";
+  table << ruler;
+  table << "| " << std::left << std::setw(20) << "particle type" << " | " << std::right
+        << std::setw(15) << "#particles" << " | " << std::setw(17) << "#interactions" << " | "
+        << std::setw(20) << "interactions/particle" << " | " << std::setw(15) << "relative weight"
+        << " |\n";
+  table << ruler;
+  for (std::size_t i = 0; i < types.size(); ++i)
+  {
+    const double avg_interactions =
+        (particlecounts[i] > 0)
+            ? static_cast<double>(interactions[i]) / static_cast<double>(particlecounts[i])
+            : 0.0;
+    const double relative_weight =
+        (reference_weight > 0.0) ? avg_interactions / reference_weight : 0.0;
+
+    table << "| " << std::left << std::setw(20) << enum_to_type_name(types[i]) << " | "
+          << std::right << std::setw(15) << particlecounts[i] << " | " << std::setw(17)
+          << interactions[i] << " | " << std::setw(20) << std::fixed << std::setprecision(2)
+          << avg_interactions << " | " << std::setw(15) << std::setprecision(3) << relative_weight
+          << " |\n";
+  }
+  table << ruler;
+  table << "| total particles: " << total_particles
+        << "   total interactions: " << total_interactions << "\n";
+  table << ruler;
+
+  Core::IO::cout << table.str() << Core::IO::endl;
 }
 
 void Particle::ParticleEngine::build_global_id_to_local_index_map()
@@ -1791,8 +1886,8 @@ void Particle::ParticleEngine::communicate_refreshed_particles(
       {
         auto it = sdata.find(torank);
         msgsizestosend[counter] = (it != sdata.end()) ? static_cast<int>(it->second.size()) : 0;
-        MPI_Isend(&msgsizestosend[counter], 1, MPI_INT, torank, 1234, comm_,
-            &sizesendrequest[counter]);
+        MPI_Isend(
+            &msgsizestosend[counter], 1, MPI_INT, torank, 1234, comm_, &sizesendrequest[counter]);
         ++counter;
       }
     }
@@ -1800,8 +1895,7 @@ void Particle::ParticleEngine::communicate_refreshed_particles(
     // receive size of messages from ALL known senders
     std::vector<MPI_Request> sizerecvrequest(numrecvfromprocs);
     for (int i = 0; i < numrecvfromprocs; ++i)
-      MPI_Irecv(
-          &msgsizestorecv[i], 1, MPI_INT, recvsources[i], 1234, comm_, &sizerecvrequest[i]);
+      MPI_Irecv(&msgsizestorecv[i], 1, MPI_INT, recvsources[i], 1234, comm_, &sizerecvrequest[i]);
 
     MPI_Waitall(numrecvfromprocs, sizerecvrequest.data(), MPI_STATUSES_IGNORE);
 
@@ -1917,8 +2011,7 @@ void Particle::ParticleEngine::communicate_direct_ghosting_map(
     for (int torank : ghost_recv_procs_)
     {
       auto it = sdata.find(torank);
-      msgsizestosend_dgm[counter] =
-          (it != sdata.end()) ? static_cast<int>(it->second.size()) : 0;
+      msgsizestosend_dgm[counter] = (it != sdata.end()) ? static_cast<int>(it->second.size()) : 0;
       MPI_Isend(&msgsizestosend_dgm[counter], 1, MPI_INT, torank, 1234, comm_,
           &sizesendrequest_dgm[counter]);
       ++counter;
@@ -2168,7 +2261,8 @@ void Particle::ParticleEngine::communicate_and_insert_ghost_particles(
       ParticleType type = static_cast<ParticleType>(type_int);
 
       // get container of ghosted particles of current particle type
-      ParticleContainer* container = particlecontainerbundle_->get_specific_container(type, Ghosted);
+      ParticleContainer* container =
+          particlecontainerbundle_->get_specific_container(type, Ghosted);
 
       // add particle to container of ghosted particles
       int ghostedindex(0);
