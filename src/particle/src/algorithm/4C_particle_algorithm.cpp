@@ -1217,8 +1217,8 @@ void Particle::ParticleAlgorithm::print_particle_interaction_cost()
         << ", avg cost " << cost_pd_bond << " ns/bond\n";
   table << ruler;
 
-  // recommended relative weights
-  table << "| recommended relative weights (for PHASE_TO_DYNLOADBALFAC or rank sizing):\n";
+  // recommended relative weights for weak-scaling rank sizing
+  table << "| recommended relative weights for weak-scaling rank sizing:\n";
   for (std::size_t i = 0; i < types.size(); ++i)
   {
     if (particle_counts[i] == 0) continue;
