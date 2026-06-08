@@ -39,6 +39,7 @@
 #include <Teuchos_TimeMonitor.hpp>
 
 #include <cstddef>
+#include <iomanip>
 #include <map>
 #include <memory>
 #include <sstream>
@@ -1051,6 +1052,13 @@ void Particle::ParticleAlgorithm::evaluate_time_step()
   // evaluate particle interactions
   if (particleinteraction_) particleinteraction_->evaluate_interactions();
 
+  // print per-type interaction cost table once, after the first evaluation
+  if (particleinteraction_ and not interaction_cost_printed_)
+  {
+    print_particle_interaction_cost();
+    interaction_cost_printed_ = true;
+  }
+
   // apply viscous damping contribution
   if (viscousdamping_) viscousdamping_->apply_viscous_damping();
 
@@ -1088,6 +1096,139 @@ void Particle::ParticleAlgorithm::set_gravity_acceleration()
 
   // set scaled gravity in particle interaction handler
   if (particleinteraction_) particleinteraction_->set_gravity(scaled_gravity);
+}
+
+void Particle::ParticleAlgorithm::print_particle_interaction_cost()
+{
+  // collect per-type stats from the interaction handler (SPH-specific; no-op for DEM)
+  std::map<ParticleType, long> sph_pairs;
+  long pd_bond_pairs = 0;
+  double sph_time_ns = 0.0;
+  double pd_time_ns = 0.0;
+  particleinteraction_->collect_interaction_type_stats(
+      sph_pairs, pd_bond_pairs, sph_time_ns, pd_time_ns);
+
+  // no stats available (e.g. DEM) → nothing to print
+  if (sph_pairs.empty() and pd_bond_pairs == 0) return;
+
+  // ordered list of stored particle types (same order as the engine diagnostic)
+  const auto& type_set = particleengine_->get_particle_container_bundle()->get_particle_types();
+  std::vector<ParticleType> types(type_set.begin(), type_set.end());
+
+  // global particle counts per type (reduce local counts across all ranks)
+  std::vector<long> particle_counts(types.size(), 0);
+  for (std::size_t i = 0; i < types.size(); ++i)
+    particle_counts[i] =
+        static_cast<long>(particleengine_->get_number_of_particles_of_specific_type(types[i]));
+  MPI_Allreduce(MPI_IN_PLACE, particle_counts.data(), static_cast<int>(particle_counts.size()),
+      MPI_LONG, MPI_SUM, get_comm());
+
+  // global actual SPH pair counts per type
+  std::vector<long> sph_pair_counts(types.size(), 0);
+  for (std::size_t i = 0; i < types.size(); ++i)
+  {
+    auto it = sph_pairs.find(types[i]);
+    if (it != sph_pairs.end()) sph_pair_counts[i] = it->second;
+  }
+  MPI_Allreduce(MPI_IN_PLACE, sph_pair_counts.data(), static_cast<int>(sph_pair_counts.size()),
+      MPI_LONG, MPI_SUM, get_comm());
+
+  // global PD bond pair count
+  MPI_Allreduce(MPI_IN_PLACE, &pd_bond_pairs, 1, MPI_LONG, MPI_SUM, get_comm());
+
+  // average SPH and PD timing over all ranks for a less rank-0-biased estimate
+  double times[2] = {sph_time_ns, pd_time_ns};
+  MPI_Allreduce(MPI_IN_PLACE, times, 2, MPI_DOUBLE, MPI_SUM, get_comm());
+  const int nproc = Core::Communication::num_mpi_ranks(get_comm());
+  const double avg_sph_time_ns = times[0] / nproc;
+  const double avg_pd_time_ns = times[1] / nproc;
+
+  // cost per interaction [ns/interaction]
+  // SPH cost is attributed uniformly to all SPH pair participants
+  const long total_sph_pairs = [&]()
+  {
+    long s = 0;
+    for (const long c : sph_pair_counts) s += c;
+    // each pair is counted twice (once per endpoint), so divide by 2 to get unique pairs
+    return s / 2;
+  }();
+  // PD bond pairs: each pair involves 2 PD particles → total PD interactions = 2 × bond count
+  const long total_pd_interactions = 2 * pd_bond_pairs;
+
+  const double cost_sph = (total_sph_pairs > 0) ? avg_sph_time_ns / total_sph_pairs : 0.0;
+  const double cost_pd_bond = (pd_bond_pairs > 0) ? avg_pd_time_ns / pd_bond_pairs : 0.0;
+
+  // only rank 0 prints
+  if (myrank_ != 0) return;
+
+  // for each type compute combined cost-weighted load per particle
+  // w_i = (SPH interactions/particle) × cost_sph + (PD bond interactions/particle) × cost_pd_bond
+  std::vector<double> combined_weight(types.size(), 0.0);
+  for (std::size_t i = 0; i < types.size(); ++i)
+  {
+    if (particle_counts[i] == 0) continue;
+    const double sph_ipp =
+        static_cast<double>(sph_pair_counts[i]) / static_cast<double>(particle_counts[i]);
+    // PD interactions/particle: 2 × pd_bond_pairs / N_pd; only non-zero for the PDPhase type
+    const double pd_ipp =
+        (types[i] == Particle::PDPhase and particle_counts[i] > 0)
+            ? static_cast<double>(total_pd_interactions) / static_cast<double>(particle_counts[i])
+            : 0.0;
+    combined_weight[i] = sph_ipp * cost_sph + pd_ipp * cost_pd_bond;
+  }
+
+  // normalize weights to the type with the smallest non-zero weight
+  double ref_weight = 0.0;
+  for (const double w : combined_weight)
+    if (w > 0.0 and (ref_weight == 0.0 or w < ref_weight)) ref_weight = w;
+
+  std::ostringstream table;
+  const std::string ruler =
+      "+----------------------+-----------------+------------------+------------------+------------"
+      "------"
+      "-+\n";
+  table << "\n" << ruler;
+  table << "| per-type interaction cost estimate (first time-step, rank-averaged timing)           "
+           "     "
+           "        |\n";
+  table << ruler;
+  table << "| " << std::left << std::setw(20) << "particle type" << " | " << std::right
+        << std::setw(15) << "SPH pairs/p" << " | " << std::setw(16) << "PD bonds/p" << " | "
+        << std::setw(16) << "cost_sph [ns/p]" << " | " << std::setw(16) << "cost_pd [ns/p]"
+        << " |\n";
+  table << ruler;
+  for (std::size_t i = 0; i < types.size(); ++i)
+  {
+    if (particle_counts[i] == 0) continue;
+    const double sph_ipp =
+        static_cast<double>(sph_pair_counts[i]) / static_cast<double>(particle_counts[i]);
+    const double pd_ipp =
+        (types[i] == Particle::PDPhase and particle_counts[i] > 0)
+            ? static_cast<double>(total_pd_interactions) / static_cast<double>(particle_counts[i])
+            : 0.0;
+    table << "| " << std::left << std::setw(20) << enum_to_type_name(types[i]) << " | "
+          << std::right << std::fixed << std::setprecision(2) << std::setw(15) << sph_ipp << " | "
+          << std::setw(16) << pd_ipp << " | " << std::setw(16) << sph_ipp * cost_sph << " | "
+          << std::setw(16) << pd_ipp * cost_pd_bond << " |\n";
+  }
+  table << ruler;
+  table << "| SPH: " << total_sph_pairs << " unique pairs, avg cost " << std::fixed
+        << std::setprecision(3) << cost_sph << " ns/pair  |  PD bonds: " << pd_bond_pairs
+        << ", avg cost " << cost_pd_bond << " ns/bond\n";
+  table << ruler;
+
+  // recommended relative weights
+  table << "| recommended relative weights (for PHASE_TO_DYNLOADBALFAC or rank sizing):\n";
+  for (std::size_t i = 0; i < types.size(); ++i)
+  {
+    if (particle_counts[i] == 0) continue;
+    const double rel = (ref_weight > 0.0) ? combined_weight[i] / ref_weight : 0.0;
+    table << "|   " << std::left << std::setw(20) << enum_to_type_name(types[i]) << " = "
+          << std::right << std::fixed << std::setprecision(3) << rel << "\n";
+  }
+  table << ruler;
+
+  Core::IO::cout << table.str() << Core::IO::endl;
 }
 
 FOUR_C_NAMESPACE_CLOSE

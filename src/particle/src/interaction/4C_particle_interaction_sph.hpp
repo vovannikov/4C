@@ -88,6 +88,9 @@ namespace Particle
     //! evaluate particle interactions
     void evaluate_interactions() override;
 
+    void collect_interaction_type_stats(std::map<ParticleType, long>& sph_actual_pairs_per_type,
+        long& pd_bond_pair_count, double& sph_eval_time_ns, double& pd_eval_time_ns) const override;
+
     //! post evaluate time step
     void post_evaluate_time_step(
         std::vector<Particle::ParticleTypeToType>& particlesfromphasetophase) override;
@@ -211,6 +214,13 @@ namespace Particle
 
     //! peridynamic handler
     std::unique_ptr<Particle::SPHPeridynamic> peridynamics_;
+
+    //! wall-clock time [ns] for SPH sub-calls and PD sub-call from the first evaluate_interactions
+    double sph_eval_time_ns_ = 0.0;
+    double pd_eval_time_ns_ = 0.0;
+
+    //! flag: interaction type statistics have been collected
+    bool stats_collected_ = false;
   };
 
 }  // namespace Particle

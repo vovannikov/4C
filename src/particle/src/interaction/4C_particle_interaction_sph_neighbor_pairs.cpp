@@ -98,6 +98,23 @@ void Particle::SPHNeighborPairs::get_relevant_particle_wall_pair_indices(
         indexofparticlewallpairs_[type_i].end());
 }
 
+std::map<Particle::ParticleType, long> Particle::SPHNeighborPairs::get_actual_pair_counts_per_type()
+    const
+{
+  std::map<ParticleType, long> counts;
+  const auto& types = particlecontainerbundle_->get_particle_types();
+  for (const auto& type_i : types)
+    for (const auto& type_j : types)
+    {
+      const long n = static_cast<long>(indexofparticlepairs_[type_i][type_j].size());
+      if (n == 0) continue;
+      // each pair involves one particle of type_i and one of type_j; count towards both types
+      counts[type_i] += n;
+      counts[type_j] += n;
+    }
+  return counts;
+}
+
 void Particle::SPHNeighborPairs::evaluate_neighbor_pairs()
 {
   // evaluate particle pairs

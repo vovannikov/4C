@@ -82,6 +82,15 @@ namespace Particle
     void get_relevant_particle_wall_pair_indices(
         const std::set<Particle::TypeEnum>& types_a, std::vector<int>& relindices) const;
 
+    /*!
+     * \brief compute per-particle-type actual interaction pair counts
+     *
+     * Returns, for each particle type, the total number of SPH interaction pairs that type
+     * participates in (both as the owned and the neighboring particle). Each pair is counted once
+     * for each of its two endpoints' types.
+     */
+    std::map<ParticleType, long> get_actual_pair_counts_per_type() const;
+
     //! evaluate neighbor pairs
     void evaluate_neighbor_pairs();
 

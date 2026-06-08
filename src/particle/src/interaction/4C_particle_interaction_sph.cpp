@@ -34,6 +34,7 @@
 #include <Teuchos_StandardParameterEntryValidators.hpp>
 #include <Teuchos_TimeMonitor.hpp>
 
+#include <chrono>
 #include <memory>
 
 FOUR_C_NAMESPACE_OPEN
@@ -426,6 +427,9 @@ void Particle::ParticleInteractionSPH::evaluate_interactions()
 {
   TEUCHOS_FUNC_TIME_MONITOR("Particle::ParticleInteractionSPH::evaluate_interactions");
 
+  // chrono timing for the first call to collect cost-per-type statistics
+  const auto t_eval_start = std::chrono::steady_clock::now();
+
   // evaluate particle neighbor pairs
   neighborpairs_->evaluate_neighbor_pairs();
   if (peridynamics_) neighborpairs_pd_->evaluate_neighbor_pairs();
@@ -464,8 +468,33 @@ void Particle::ParticleInteractionSPH::evaluate_interactions()
   // add rigid particle contact contribution to force field
   if (rigidparticlecontact_) rigidparticlecontact_->add_force_contribution();
 
-  // add peridynamic interaction contribution to acceleration field
+  // time the PD sub-call separately so we can estimate its cost per interaction
+  const auto t_before_pd = std::chrono::steady_clock::now();
   if (peridynamics_) peridynamics_->add_acceleration_contribution();
+  const auto t_after_pd = std::chrono::steady_clock::now();
+
+  // record timings on the first call only
+  if (not stats_collected_)
+  {
+    namespace chr = std::chrono;
+    pd_eval_time_ns_ =
+        static_cast<double>(chr::duration_cast<chr::nanoseconds>(t_after_pd - t_before_pd).count());
+    sph_eval_time_ns_ =
+        static_cast<double>(
+            chr::duration_cast<chr::nanoseconds>(t_after_pd - t_eval_start).count()) -
+        pd_eval_time_ns_;
+    stats_collected_ = true;
+  }
+}
+
+void Particle::ParticleInteractionSPH::collect_interaction_type_stats(
+    std::map<ParticleType, long>& sph_actual_pairs_per_type, long& pd_bond_pair_count,
+    double& sph_eval_time_ns, double& pd_eval_time_ns) const
+{
+  sph_actual_pairs_per_type = neighborpairs_->get_actual_pair_counts_per_type();
+  pd_bond_pair_count = peridynamics_ ? neighborpairs_pd_->get_pair_count() : 0L;
+  sph_eval_time_ns = sph_eval_time_ns_;
+  pd_eval_time_ns = pd_eval_time_ns_;
 }
 
 void Particle::ParticleInteractionSPH::post_evaluate_time_step(

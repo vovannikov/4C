@@ -379,8 +379,20 @@ namespace Particle
      */
     void set_gravity_acceleration();
 
+    /*!
+     * \brief print per-type interaction cost table after the first time-step evaluation
+     *
+     * Combines actual SPH/PD pair counts with first-step wall-clock timings from the interaction
+     * handler to report, for each particle type, the measured cost per interaction and a
+     * cost-weighted relative weight suitable for weak-scaling rank selection.
+     */
+    void print_particle_interaction_cost();
+
     //! processor id
     const int myrank_;
+
+    //! flag: per-type interaction cost table has been printed
+    bool interaction_cost_printed_ = false;
 
     //! particle simulation parameter list
     const Teuchos::ParameterList& params_;

@@ -20,6 +20,8 @@
 
 #include <mpi.h>
 
+#include <map>
+
 FOUR_C_NAMESPACE_OPEN
 
 /*---------------------------------------------------------------------------*
@@ -79,6 +81,23 @@ namespace Particle
 
     //! evaluate particle interactions
     virtual void evaluate_interactions() = 0;
+
+    /*!
+     * \brief collect per-type interaction cost statistics after the first evaluate_interactions
+     * call
+     *
+     * Fills \p sph_actual_pairs_per_type with the global count of SPH interaction pairs each
+     * particle type participates in, \p pd_bond_pair_count with the global PD bond pair count,
+     * \p sph_eval_time_ns with the wall-clock time [ns] spent on SPH sub-calls during the first
+     * evaluate_interactions, and \p pd_eval_time_ns with the time spent on the PD sub-call.
+     *
+     * The default implementation does nothing (relevant only for SPH).
+     */
+    virtual void collect_interaction_type_stats(
+        std::map<ParticleType, long>& sph_actual_pairs_per_type, long& pd_bond_pair_count,
+        double& sph_eval_time_ns, double& pd_eval_time_ns) const
+    {
+    }
 
     //! post evaluate time step
     virtual void post_evaluate_time_step(

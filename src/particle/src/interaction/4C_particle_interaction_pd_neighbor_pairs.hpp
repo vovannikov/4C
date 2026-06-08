@@ -72,6 +72,9 @@ namespace Particle
       return particlepairdata_;
     };
 
+    //! get total number of peridynamic bond pairs on this processor
+    inline long get_pair_count() const { return static_cast<long>(particlepairdata_.size()); }
+
     //! set pd bond list
     void set_bond_list(const std::shared_ptr<
         std::vector<std::pair<Particle::LocalGlobalIndexTuple, Particle::LocalGlobalIndexTuple>>>
